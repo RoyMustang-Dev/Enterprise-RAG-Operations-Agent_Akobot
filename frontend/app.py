@@ -35,6 +35,22 @@ st.title("Enterprise RAG Operations Agent")
 st.sidebar.header("Operations")
 option = st.sidebar.selectbox("Choose Action", ["Chat", "Ingest Documents", "System Health"])
 
+# Global LLM Settings
+st.sidebar.markdown("---")
+st.sidebar.header("LLM Settings")
+
+llm_choice = st.sidebar.radio(
+    "Select Model Provider:",
+    ("Local (Ollama llama3.2)", "Sarvam (sarvam-m)")
+)
+
+sarvam_api_key = ""
+if "Sarvam" in llm_choice:
+    sarvam_api_key = st.sidebar.text_input("Sarvam API Key", type="password")
+    if not sarvam_api_key:
+        st.sidebar.warning("API Key required for Sarvam models.")
+
+
 if option == "System Health":
     st.subheader("System Status")
     try:
@@ -45,6 +61,7 @@ if option == "System Health":
             st.error("Backend returned an error")
     except Exception as e:
         st.error(f"Could not connect to backend: {e}")
+
 
 elif option == "Ingest Documents":
     st.subheader("Ingest Documents")
@@ -203,11 +220,30 @@ elif option == "Chat":
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
                 
-                with st.spinner("Analyzing documents..."):
+                with st.status("Analyzing documents...", expanded=True) as status:
                     try:
-                        response_data = rag_service.answer_query(prompt)
+                        # Determine model parameters
+                        if "Ollama" in llm_choice:
+                            provider = "ollama"
+                            model_name = "llama3.2:1b"
+                        else:
+                            provider = "sarvam"
+                            model_name = "sarvam-m"
+                            
+                        # Re-initialize RAGService with selected model
+                        # (Normally we'd implement a set_model method, but re-init is fine for testing)
+                        current_rag = RAGService(model_provider=provider, model_name=model_name, api_key=sarvam_api_key)
+                        
+                        # Define status update callback for UI
+                        def update_ui_status(msg):
+                            status.update(label=msg)
+                            st.write(f"⚙️ {msg}")
+
+                        response_data = current_rag.answer_query(prompt, status_callback=update_ui_status)
                         answer = response_data["answer"]
                         sources = response_data["sources"]
+                        
+                        status.update(label="Complete!", state="complete", expanded=False)
                         
                         message_placeholder.markdown(answer)
                         
