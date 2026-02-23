@@ -1,3 +1,10 @@
+"""
+Grounded RAG (Retrieval-Augmented Generation) Agent
+
+This is the core informational actor of the LangGraph DAG.
+It intercepts state, triggers the VectorDB Retriever to fetch strictly relevant 
+context chunks, and executes a grounded generation prompt using the assigned LLM.
+"""
 from backend.agents.base import BaseAgent
 from backend.orchestrator.state import AgentState
 import logging
@@ -9,20 +16,40 @@ class RAGAgent(BaseAgent):
     """
     
     def __init__(self, llm_client=None, retriever=None):
+        """
+        Initializes the RAG Agent with Generation and Retrieval dependencies.
+        
+        Args:
+            llm_client: The model wrapper allocated by the Orchestrator.
+            retriever: The active Vector Store (FAISS/Qdrant) search tool.
+        """
         super().__init__(llm_client)
         self.retriever = retriever
         
     def execute(self, state: AgentState) -> dict:
+        """
+        Executes the RAG pipeline on the current state graph.
+        
+        Args:
+            state (AgentState): The global system dict holding the user query.
+            
+        Returns:
+            dict: The mutated state containing the retrieved chunks and synthesized answer.
+        """
+        # Prioritize an AI-Rewritten Search Query if available, otherwise fallback to the raw query
         query = state.get("search_query") or state.get("query", "")
         context_chunks = state.get("context_chunks", [])
         context_text = state.get("context_text", "")
         
-        # 1. Retrieval (If not already fetched by a pre-processor)
+        # -------------------------------------------------------------------------
+        # 1. Semantic Retrieval (If not pre-fetched by another node)
+        # -------------------------------------------------------------------------
         if not context_chunks and self.retriever:
             print(f"RAG Agent: Retrieving context for '{query}'...")
+            # Execute embedding generation and high-dimensional cosine similarity search
             context_chunks = self.retriever.search(query)
             
-            # Format context text
+            # Format raw dictionaries into a structured text string for the LLM Prompt Sequence
             if context_chunks:
                 context_text = "\n\n".join(
                     [f"FILE: {c.get('source', 'Unknown')}\n{c.get('text', '')}" for c in context_chunks]
@@ -30,7 +57,11 @@ class RAGAgent(BaseAgent):
             else:
                 context_text = ""
                 
-        # 2. Generation Phase
+        # -------------------------------------------------------------------------
+        # 2. Safety Fallback (Context Missing)
+        # -------------------------------------------------------------------------
+        # If the database returns completely empty results, immediately halt generation.
+        # This prevents the LLM from hallucinating an answer outside the knowledge base context.
         if not context_text:
             return {
                 "answer": "I couldn't find any relevant information in the uploaded documents to answer your question.",
@@ -39,6 +70,9 @@ class RAGAgent(BaseAgent):
                 "context_text": ""
             }
             
+        # -------------------------------------------------------------------------
+        # 3. Grounded Prompt Engineering
+        # -------------------------------------------------------------------------
         system_prompt = """You are Galactus — a grounded enterprise knowledge assistant.
 
 Your mandate is to answer the user's Question using strictly and ONLY the provided Context chunks.
@@ -56,15 +90,18 @@ Accuracy is more important than completeness."""
         
         print("RAG Agent: Synthesizing Answer...")
         
-        # Determine Temperature Mode
+        # Determine strict generation heuristics
         temperature = 0.4
         reasoning = "low"
         
-        # Check if analytical routing accidentally fell through
+        # Failsafe telemetry boundary marker: If analytical routing accidentally fell through to RAG, elevate compute thresholds
         if state.get("intent") == "analytical":
             temperature = 0.7
             reasoning = "high"
             
+        # -------------------------------------------------------------------------
+        # 4. LLM Generation Pipeline
+        # -------------------------------------------------------------------------
         answer = self.llm_client.generate(
             prompt=user_prompt,
             system_prompt=system_prompt,
@@ -73,7 +110,7 @@ Accuracy is more important than completeness."""
             stream=state.get("streaming_callback") is not None
         )
         
-        # If streaming is enabled, `generate` returns a generator (or we handled the callback inside if it's the old API style, let's assume we build the final string string either way in our client wrapper)
+        # Unpack execution generator if active streaming UI pipeline is attached to pipeline loop
         if hasattr(answer, '__iter__') and not isinstance(answer, str):
             final_ans = ""
             for chunk in answer:
@@ -82,12 +119,17 @@ Accuracy is more important than completeness."""
                 final_ans += chunk
             answer = final_ans
             
-        import re
-        answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
+        # UI NOTE: We deliberately do not strip `<think>` syntax markers here. 
+        # The Traceability Streamlit UI explicitly extracts them for the expanding thought block.
         
         return {
             "answer": answer,
             "context_chunks": context_chunks,
             "context_text": context_text,
-            "sources": context_chunks
+            "sources": context_chunks,
+            "optimizations": {
+                "temperature": temperature,
+                "reasoning_effort": reasoning,
+                "agent_routed": "RAGAgent"
+            }
         }

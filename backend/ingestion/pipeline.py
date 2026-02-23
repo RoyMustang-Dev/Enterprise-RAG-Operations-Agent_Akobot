@@ -1,3 +1,9 @@
+"""
+Master Ingestion Pipeline Orchestrator
+
+This script logically chains the loader, chunker, embedding generation, 
+and database persistence operations into a single cohesive synchronous block.
+"""
 import os
 import time
 from typing import List, Dict
@@ -9,30 +15,32 @@ from backend.vectorstore.faiss_store import FAISSStore
 
 class IngestionPipeline:
     """
-    Orchestrates the entire document ingestion workflow.
+    Orchestrates the entire document ingestion chronological workflow.
     
-    Flow:
-    1. Loader: Reads file from disk.
-    2. Chunker: Splits text into manageable segments.
-    3. Embedder: Converts text segments into vector representations.
-    4. Vector Store: Saves vectors and metadata for retrieval.
+    Execution Flow:
+    1. Loader: Reads temporary file data from disk into system RAM.
+    2. Chunker: Splits the massive text array into mathematically bound segments.
+    3. Embedder: Converts the text segments into high-dimensional vector representations.
+    4. Vector Store: Saves the vectors alongside their descriptive metadata dictionaries for RAG retrieval.
     """
     def __init__(self):
-        """Initializes the pipeline with EmbeddingModel and FAISSStore."""
+        """
+        Initializes the pipeline with explicit EmbeddingModel and Database backend adapters.
+        """
         self.embedder = EmbeddingModel()
         self.vector_store = FAISSStore()
 
     def run_ingestion(self, file_paths: List[str], metadatas: List[Dict] = None, reset_db: bool = False) -> int:
         """
-        Runs the full ingestion pipeline for a list of files or crawled content paths.
+        Executes the exhaustive ingestion loop mapping provided files to the semantic vector index.
         
         Args:
-            file_paths (List[str]): List of absolute paths to the files to ingest.
-            metadatas (List[Dict], optional): List of metadata dictionaries corresponding to each file.
-                                              Defaults to None.
-                                              
+            file_paths (List[str]): Array of OS paths pointing to raw files meant for ingestion.
+            metadatas (List[Dict], optional): Explicit dictionaries mapping custom tags (e.g. source URL).
+            reset_db (bool): If True, triggers a complete destructive wipe of the Vector Database.
+                             
         Returns:
-            int: The total number of text chunks successfully ingested and stored.
+            int: The total numerical metric of successfully embedded and persisted text chunks.
         """
         if not file_paths:
             return 0
@@ -41,28 +49,33 @@ class IngestionPipeline:
         all_chunks = []
         all_metadatas = []
         
-        # 0. Reset Knowledge Base if requested
+        # -------------------------------------------------------------------------
+        # 0. Defensive Database Truncation
+        # -------------------------------------------------------------------------
         if reset_db:
-            print("Resetting Knowledge Base...")
+            print("Resetting active Knowledge Base index mappings...")
             self.vector_store.clear()
 
-        print(f"Starting ingestion for {len(file_paths)} files...")
+        print(f"Starting pipeline ingestion loop for {len(file_paths)} system files...")
         
+        # -------------------------------------------------------------------------
+        # 1. & 2. Loading and Chunking Sequences Loop
+        # -------------------------------------------------------------------------
         for i, file_path in enumerate(file_paths):
             try:
-                print(f"Processing: {file_path}")
-                # 1. Load Text
+                print(f"Processing Data File: {file_path}")
+                # Dispatch mapping load based on file extension
                 text = load_document(file_path)
                 if not text:
-                    print(f"Warning: No text extracted from {file_path}")
+                    print(f"Warning Sequence: No text successfully extracted natively from {file_path}")
                     continue
                     
-                # 2. Chunk Text
+                # Subdivide massive string payload into mathematical chunks
                 chunks = chunk_text(text)
                 if not chunks:
                     continue
                 
-                # Prepare metadata for each chunk
+                # Append default tracking metadata required by the Retrieval Tool filtering logic
                 base_meta = metadatas[i] if metadatas and i < len(metadatas) else {}
                 base_meta.update({
                     "source": os.path.basename(file_path),
@@ -70,6 +83,7 @@ class IngestionPipeline:
                     "ingested_at": time.time()
                 })
                 
+                # Flatten the data struct
                 for chunk in chunks:
                     all_chunks.append(chunk)
                     all_metadatas.append(base_meta.copy())
@@ -77,37 +91,37 @@ class IngestionPipeline:
                 total_chunks += len(chunks)
                 
             except Exception as e:
-                print(f"Error processing {file_path}: {e}")
+                print(f"Error Pipeline extraction processing {file_path}: {e}")
 
         if not all_chunks:
-            print("No chunks to ingest.")
+            print("No valid data chunks generated to actively ingest.")
             return 0
 
-        # 3. Generate Embeddings (Batch)
-        print(f"Generating embeddings for {len(all_chunks)} chunks...")
+        # -------------------------------------------------------------------------
+        # 3. Synchronous Embedding Generation
+        # -------------------------------------------------------------------------
+        print(f"Executing mathematical embedding generations array for {len(all_chunks)} system chunks...")
         embeddings = []
         try:
+            # Batch call the BAAI engine
             embeddings = self.embedder.generate_embeddings(all_chunks)
             if not embeddings:
-                # If we have chunks but no embeddings, it's a failure
+                # Catch empty tensor bugs explicitly
                 if len(all_chunks) > 0:
-                     raise ValueError("Embedding model returned no embeddings for chunks.")
+                     raise ValueError("Embedding model returned an explicitly empty array for chunks.")
         except Exception as e:
-            print(f"Embedding generation failed: {e}")
+            print(f"Mass Embedding generation failed catastrophically: {e}")
             raise e
         
-        # 4. Store in Vector DB
-        print("Adding to vector store...")
+        # -------------------------------------------------------------------------
+        # 4. Persistence Execution
+        # -------------------------------------------------------------------------
+        print("Pushing normalized vectors to permanent vector store backend...")
         try:
             self.vector_store.add_documents(all_chunks, embeddings, all_metadatas)
         except Exception as e:
-            print(f"Vector store addition failed: {e}")
+            print(f"Vector store native database addition failed explicitly: {e}")
             raise e
         
-        print(f"Ingestion complete. Added {len(all_chunks)} chunks.")
+        print(f"Orchestration Ingestion loop complete. Successfully persisted {len(all_chunks)} exact chunks.")
         return len(all_chunks)
-
-if __name__ == "__main__":
-    # Test run
-    pipeline = IngestionPipeline()
-    # Mock usage: pipeline.run_ingestion(["tests/data/sample.txt"])

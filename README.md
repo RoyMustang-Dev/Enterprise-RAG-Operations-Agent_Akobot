@@ -97,11 +97,32 @@ enterprise-rag-agent/
     ```
 
 ### Running the Application
-5.  **Start the Frontend:**
+
+To run the full stack, you need to open two separate terminals.
+
+5.  **Start the Backend API (Uvicorn):**
+    Open your first terminal, ensure your virtual environment is activated, and run the FastAPI server:
     ```bash
+    # Activate environment (if not already active)
+    venv\Scripts\activate      # Windows
+    # source venv/bin/activate # Mac/Linux
+    
+    # Start the backend server
+    uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+    ```
+    ✅ **Swagger API Docs:** Access the interactive endpoints at `http://localhost:8000/docs`
+
+6.  **Start the Frontend Portal (Streamlit):**
+    Open a *second* terminal window, activate the virtual environment again, and launch the UI:
+    ```bash
+    # Activate environment in the new terminal
+    venv\Scripts\activate      # Windows
+    # source venv/bin/activate # Mac/Linux
+    
+    # Start the Streamlit dashboard
     streamlit run frontend/app.py
     ```
-    Access the UI at `http://localhost:8501`.
+    ✅ **Agent Dashboard UI:** Access the portal at `http://localhost:8501`
 
 ---
 
@@ -150,6 +171,26 @@ enterprise-rag-agent/
 4.  **UI Alignment & Optimization:**
     -   Streamlit UI `st.status` dynamically adjusts based on the active agent (e.g., changes from "Analyzing..." to "Agent: Smalltalk").
     -   Silenced upstream framework warnings in the embedding layer (BAAI layer misalignments and HuggingFace throttles).
+
+---
+
+### ✅ Phase 5: API-First Decoupling & Multimodal SaaS Architecture
+**Goal:** Transition from a monolithic Streamlit UI to a fully headless, API-first architecture providing scalable endpoints for external clients.
+- Decoupled the Streamlit UI from the core logic, exposing state-of-the-art FastAPI endpoints (`/api/v1/chat`, `/api/v1/ingest/files`, `/api/v1/settings`).
+- Introduced **Multimodal processing** allowing the API to natively accept images, documents, and audio (integrated with Gemini 1.5 Flash and faster-whisper over `multipart/form-data`).
+- Structured the LLM Routing dynamically using `LLMRouter` (`backend/generation/llm_router.py`), delegating specific sub-tasks to situational models while the core orchestrator manages the master state.
+
+### ✅ Phase 6: Enterprise Traceability & Audit Logging
+**Goal:** Guarantee complete operational transparency by logging agent decision metrics, hallucination detections, and routing logic securely to disk.
+- Refactored the LangGraph orchestrator (`backend/orchestrator/graph.py`) to propagate rich dictionary structures for optimization metadata and verdicts.
+- Implemented an `audit_logs.jsonl` writer natively in `backend/generation/rag_service.py`, ensuring every single query explicitly records the precise Routing Path, Timestamp, Verifier Verdict, and Context Confidence Score.
+- Restored frontend UI layout columns to map dynamic outputs, prominently displaying Hallucination flags and nested reasoning `<think>` chains seamlessly.
+
+### 🔄 Phase 7: Enterprise Vector Database Upgrade (Qdrant)
+**Goal:** Eliminate the scalability bottleneck of local FAISS flat-files by migrating to a managed Cloud Vector Database capable of handling high-dimensional semantic search at scale for multi-tenant isolation.
+- Selected **Qdrant** for its massive "1GB Free" Cloud Tier (~1M vectors) and open-source Docker adaptability, ensuring zero-cost scaling and no vendor lock-in.
+- Upgrading `backend/ingestion/chunker.py` to utilize a fully token-aware `RecursiveCharacterTextSplitter`. This prevents critical data truncation that plagued the legacy 512-word methodology.
+- Configuring explicit BGE `L2 Normalization` inside `backend/embeddings/embedding_model.py` to guarantee mathematically flawless Cosine Similarity calculations across the remote Qdrant index.
 
 ---
 

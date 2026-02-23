@@ -11,3 +11,4 @@ pytest
 langgraph
 langchain-core
 pydantic
+python-multipart

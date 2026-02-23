@@ -1,3 +1,10 @@
+"""
+Complex Analytical & Reasoning Agent
+
+Unlike standard RAG, this node forces the underlying foundation model to utilize 
+maximum compute constraints, higher temperatures, and broader retrieval nets 
+to cross-compare documents or execute deep factual calculations.
+"""
 from backend.agents.base import BaseAgent
 from backend.orchestrator.state import AgentState
 
@@ -8,19 +15,33 @@ class AnalyticalAgent(BaseAgent):
     """
     
     def __init__(self, llm_client=None, retriever=None):
+        """
+        Initializes the Analytical Agent with heavy-compute dependencies.
+        """
         super().__init__(llm_client)
         self.retriever = retriever
         
     def execute(self, state: AgentState) -> dict:
+        """
+        Executes the heavy-reasoning pipeline on the current state graph.
+        
+        Args:
+            state (AgentState): The global system dict holding the user query.
+            
+        Returns:
+            dict: The mutated output state containing heavily reasoned answers.
+        """
         query = state.get("search_query") or state.get("query", "")
         context_chunks = state.get("context_chunks", [])
         context_text = state.get("context_text", "")
         
         print("Analytical Agent: Initializing high-reasoning pipeline...")
         
-        # 1. Broad Retrieval (If not fetched)
-        # Analytical agent needs a wider context net (e.g. k=40) to compare things, 
-        # but for now we hook into the standard retriever
+        # -------------------------------------------------------------------------
+        # 1. Broad Semantic Retrieval
+        # -------------------------------------------------------------------------
+        # Analytical operations typically demand a wider context net (e.g. k=40) 
+        # to effectively locate and compare scattered metrics across multiple disparate PDFs.
         if not context_chunks and self.retriever:
             print(f"Analytical Agent: Retrieving analytical context for '{query}'...")
             context_chunks = self.retriever.search(query)
@@ -32,7 +53,9 @@ class AnalyticalAgent(BaseAgent):
             else:
                 context_text = ""
                 
-        # 2. Generation Phase
+        # -------------------------------------------------------------------------
+        # 2. Safety Fallback (Context Missing)
+        # -------------------------------------------------------------------------
         if not context_text:
             return {
                 "answer": "There is insufficient data in the uploaded documents to perform this analysis.",
@@ -41,6 +64,9 @@ class AnalyticalAgent(BaseAgent):
                 "context_text": ""
             }
             
+        # -------------------------------------------------------------------------
+        # 3. High-Reasoning Prompt Engineering
+        # -------------------------------------------------------------------------
         system_prompt = """You are Galactus — an Expert Analytical Knowledge Sandbox.
 
 Your task is to perform deep reasoning, multi-document comparison, or calculation based STRICTLY on the provided Context.
@@ -59,7 +85,8 @@ Think critically before stating your final answer."""
         
         print("Analytical Agent: Synthesizing Compute-Heavy Answer...")
         
-        # Analytical routing forces High Compute & higher temperature for creativity
+        # Analytical routing EXPLICITLY forces High Compute requirements and a 
+        # higher temperature dictating creative problem-solving boundaries within the active LLM mapping layers.
         temperature = 0.5
         reasoning = "high"
             
@@ -71,6 +98,7 @@ Think critically before stating your final answer."""
             stream=state.get("streaming_callback") is not None
         )
         
+        # Unpack generator payload chunks if streaming logic is tied locally to the frontend
         if hasattr(answer, '__iter__') and not isinstance(answer, str):
             final_ans = ""
             for chunk in answer:
@@ -79,9 +107,6 @@ Think critically before stating your final answer."""
                 final_ans += chunk
             answer = final_ans
             
-        import re
-        answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
-        
         return {
             "answer": answer,
             "context_chunks": context_chunks,
