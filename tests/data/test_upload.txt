@@ -1,1 +1,0 @@
-This is a strictly formatted UTF-8 validation string designed to be ingested by the newly integrated Qdrant Knowledge Base Architecture.

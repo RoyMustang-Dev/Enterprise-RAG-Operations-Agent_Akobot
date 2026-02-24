@@ -36,14 +36,14 @@ option = st.sidebar.selectbox("Choose Action", ["Chat", "Ingest Documents", "Sys
 st.sidebar.markdown("---")
 st.sidebar.header("LLM Settings")
 
-st.sidebar.markdown("**Provider:** Sarvam AI (sarvam-m)")
+st.sidebar.markdown("**Provider:** Groq API (llama-3.3-70b-versatile)")
 
 # Failsafe UI layer intercepting direct user keys if standard `.env` maps are offline
-existing_key = os.getenv("SARVAM_API_KEY", "")
+existing_key = os.getenv("GROQ_API_KEY", "")
 
-sarvam_api_key = st.sidebar.text_input("Sarvam API Key", value=existing_key, type="password")
-if not sarvam_api_key:
-    st.sidebar.warning("API Key required for Sarvam models.")
+groq_api_key = st.sidebar.text_input("Groq API Key", value=existing_key, type="password")
+if not groq_api_key:
+    st.sidebar.warning("API Key required for Groq models.")
 
 
 # =========================================================================
@@ -109,11 +109,11 @@ elif option == "Ingest Documents":
     ingestion_mode = st.radio(
         "Ingestion Mode:",
         ("Start Fresh (Clear Logic)", "Append to Knowledge Base"),
-        help="Start Fresh will forcefully wipe the existing native C++ database mappings. Append will selectively add text chunks to it."
+        help="Start Fresh will forcefully wipe the existing active Qdrant database mappings. Append will selectively add text chunks to it."
     )
     
     if ingestion_mode == "Append to Knowledge Base":
-        st.warning("⚠️ Warning: When natively appending, ensure you are not uploading duplicate system documents. Logic to natively detect exact subset duplicates is currently experimental.")
+        st.warning("⚠️ Warning: When natively appending, ensure you are not uploading duplicate system documents. Logic to natively detect exact subset duplicates in Qdrant is currently experimental.")
 
     # -------------------------------------------------------------------------
     # Ingestion API Execution Logic
