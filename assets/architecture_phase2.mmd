@@ -3,27 +3,26 @@ graph LR
     Input([Chunked Data])
 
     %% Embedding Module
-    subgraph Embeddings [Embeddings]
+    subgraph Embeddings [app/retrieval/]
         direction TB
         Space0[ ]
-        Space0 ~~~ Model{BAAI bge-large<br/>Model}
+        Space0 ~~~ Model{app/retrieval/<br/>embeddings.py}
         style Space0 height:0px,width:0px,fill:none,stroke:none,color:none
     end
 
     %% Storage Module
-    subgraph Vector [Vector Store]
+    subgraph Vector [Qdrant & BAAI]
         direction TB
         Space1[ ]
-        Space1 ~~~ FAISS[(FAISS<br/>Index)]
-        Space1 ~~~ Meta[(Metadata<br/>Pickle)]
+        Space1 ~~~ FAISS[(Qdrant<br/>Cloud DB)]
+        Space1 ~~~ Meta[(BAAI<br/>bge-large)]
         style Space1 height:0px,width:0px,fill:none,stroke:none,color:none
     end
 
     %% Flow
     Input -->|Text Chunks| Model
-    Model -->|Dense Vectors| FAISS
-    Input -.->|Metadata| Meta
-    FAISS <-->|Sync| Meta
+    Model -.->|GPU Inference| Meta
+    Model -->|L2 Normalized Vectors| FAISS
 
     %% Styling
     classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#212529;

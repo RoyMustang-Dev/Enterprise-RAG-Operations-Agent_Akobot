@@ -1,31 +1,27 @@
 graph LR
     %% Inputs
-    subgraph Sources [Enterprise Data]
+    subgraph Sources [User Inputs]
         direction TB
-        PDF((PDF Files))
-        DOCX((DOCX Files))
-        TXT((TXT Files))
-        URL((Web URLs))
+        DOC((PDF / DOCX))
+        WEB((URL / SPA))
     end
 
     %% Ingestion Module
-    subgraph Ingestion [Ingestion Engine]
+    subgraph Ingestion [app/ingestion/]
         direction LR
-        Loader{Document<br/>Parsers}
-        Crawler{Playwright<br/>Crawler}
-        Chunker[Text<br/>Chunker]
+        Loader{app/ingestion/<br/>loader.py}
+        Crawler{app/ingestion/<br/>crawler_service.py}
+        Chunker[app/ingestion/<br/>chunker.py]
     end
 
     %% Flow
-    PDF --> Loader
-    DOCX --> Loader
-    TXT --> Loader
-    URL --> Crawler
+    DOC --> Loader
+    WEB -->|Playwright| Crawler
 
     Loader -->|Raw Text| Chunker
     Crawler -->|Raw Text| Chunker
 
-    Chunker --> Output([Chunked Data])
+    Chunker --> Output([512-Token Windows])
 
     %% Styling
     classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#212529;
@@ -35,7 +31,7 @@ graph LR
     classDef agent fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
     classDef startend fill:#e7f5ff,stroke:#339af0,stroke-width:2px,rx:20,ry:20;
 
-    class PDF,DOCX,TXT,URL input;
+    class DOC,WEB input;
     class Loader,Crawler core;
     class Chunker agent;
     class Output startend;

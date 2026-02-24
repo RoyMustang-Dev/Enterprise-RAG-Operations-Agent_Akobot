@@ -3,35 +3,37 @@ graph LR
     User((User Input))
 
     %% Core Components
-    subgraph Orcehstrator [Orchestrator Layer]
-        Router{Semantic<br/>Router}
+    subgraph Orcehstrator [app/supervisor/]
+        Router{app/supervisor/<br/>intent.py}
+        Groq8B((Groq:<br/>llama-3.1-8b))
     end
 
-    subgraph Phase4 [Phase 4: Agents]
+    subgraph Phase4 [app/agents/]
         direction TB
         Space1[ ]
-        Space1 ~~~ Smalltalk[Smalltalk<br/>Agent]
-        Space1 ~~~ Analytical[Analytical<br/>Agent]
+        Space1 ~~~ Smalltalk[app/supervisor/<br/>router.py]
+        Space1 ~~~ Analytical[app/agents/<br/>analytical.py]
+        RagAgent[app/agents/<br/>rag.py]
         style Space1 height:0px,width:0px,fill:none,stroke:none,color:none
     end
     
-    subgraph Phase3 [Phase 3: RAG Core]
+    subgraph Phase3 [app/retrieval/]
         direction TB
         Space2[ ]
-        Space2 ~~~ RagAgent[RAG<br/>Agent]
-        VectorDB[(FAISS<br/>Store)]
+        VectorDB[(Qdrant<br/>Cloud DB)]
         style Space2 height:0px,width:0px,fill:none,stroke:none,color:none
     end
 
     %% Flow
     User -->|Query| Router
+    Router -.->|0.0s Triage| Groq8B
     
-    Router -->|Greeting| Smalltalk
-    Router -->|Comparison| Analytical
-    Router -->|Information| RagAgent
+    Router -->|Intent: Greeting| Smalltalk
+    Router -->|Intent: Reasoning| Analytical
+    Router -->|Intent: Question| RagAgent
     
     Analytical -->|Hybrid Search| VectorDB
-    RagAgent -->|Hybrid Search| VectorDB
+    RagAgent -->|Search| VectorDB
     
     VectorDB -.->|Context| Analytical
     VectorDB -.->|Context| RagAgent
@@ -45,4 +47,5 @@ graph LR
 
     class User input;
     class Router,Smalltalk,Analytical,RagAgent agent;
+    class Groq8B core;
     class VectorDB storage;
