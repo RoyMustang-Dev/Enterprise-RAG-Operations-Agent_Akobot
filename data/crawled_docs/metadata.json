@@ -1,0 +1,25 @@
+{
+  "url": "https://string",
+  "session_id": "7c459455-26e5-49eb-92ff-d12eb04d2105",
+  "timestamp": "2026-02-25T00:19:44.635134",
+  "duration_seconds": 24.803317,
+  "pages_crawled": 1,
+  "pages": [
+    {
+      "id": 90,
+      "session_id": "7c459455-26e5-49eb-92ff-d12eb04d2105",
+      "url": "https://string",
+      "title": "Error",
+      "content": "Page.goto: net::ERR_NAME_NOT_RESOLVED at https://string/\nCall log:\n  - navigating to \"https://string/\", waiting until \"domcontentloaded\"\n",
+      "depth": 0,
+      "status": "failed",
+      "timestamp": "2026-02-25T00:20:09.352611"
+    }
+  ],
+  "links": {
+    "allowed_sample": [],
+    "blocked_sample": [],
+    "total_allowed": 0,
+    "total_blocked": 0
+  }
+}

@@ -9,6 +9,7 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 from typing import List, Dict
 import os
 import uuid
+import threading
 
 class QdrantStore:
     """
@@ -21,6 +22,7 @@ class QdrantStore:
         if cls._instance is None:
             cls._instance = super(QdrantStore, cls).__new__(cls)
             cls._instance._initialized = False
+            cls._instance._lock = threading.Lock()
         return cls._instance
 
     def __init__(self, dimension: int = 1024, collection_name: str = "enterprise_rag", path: str = "data/qdrant_storage"):
@@ -64,19 +66,20 @@ class QdrantStore:
         Hard-resets the active vector memory state and forcefully deletes the persisted OS files.
         Typically only utilized explicitly when the user requests a "Reset Knowledge Base" trigger.
         """
-        import shutil
-        # 1. Release the active SQLite file handlers
-        self.client.close()
-        
-        # 2. Physically wipe the local disk directory
-        if os.path.exists(self.path):
-            shutil.rmtree(self.path, ignore_errors=True)
-        os.makedirs(self.path, exist_ok=True)
-        
-        # 3. Transparently Re-initialize the Client
-        self.client = QdrantClient(path=self.path)
-        self._ensure_collection()
-        print("Explicit Qdrant Vector database cleared.")
+        with self._lock:
+            import shutil
+            # 1. Release the active SQLite file handlers
+            self.client.close()
+            
+            # 2. Physically wipe the local disk directory
+            if os.path.exists(self.path):
+                shutil.rmtree(self.path, ignore_errors=True)
+            os.makedirs(self.path, exist_ok=True)
+            
+            # 3. Transparently Re-initialize the Client
+            self.client = QdrantClient(path=self.path)
+            self._ensure_collection()
+            print("Explicit Qdrant Vector database cleared.")
 
     def get_all_documents(self) -> List[str]:
         """
@@ -125,31 +128,33 @@ class QdrantStore:
             )
             points.append(point)
             
-        self.client.upsert(
-            collection_name=self.collection_name,
-            points=points
-        )
-        print(f"Added {len(chunks)} structural documents to Qdrant vector store layer. Memory Total: {self.ntotal}")
+        with self._lock:
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points
+            )
+            print(f"Added {len(chunks)} structural documents to Qdrant vector store layer. Memory Total: {self.ntotal}")
 
     def search(self, query_embedding: List[float], k: int = 5) -> List[Dict]:
         """
         Executes a high-speed L2 Distance boundary search over the entire massive index mappings array.
         """
-        search_result = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_embedding,
-            limit=k
-        )
-        
-        results = []
-        for hit in search_result.points:
-            result = hit.payload.copy() if hit.payload else {}
-            # Backwards compatibility check
-            if 'text' in result and 'page_content' not in result:
-                result['page_content'] = result['text']
+        with self._lock:
+            search_result = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_embedding,
+                limit=k
+            )
             
-            # Attach mathematical retrieval distance to the semantic chunk logic string payload
-            result['score'] = hit.score
-            results.append(result)
+            results = []
+            for hit in search_result.points:
+                result = hit.payload.copy() if hit.payload else {}
+                # Backwards compatibility check
+                if 'text' in result and 'page_content' not in result:
+                    result['page_content'] = result['text']
                 
-        return results
+                # Attach mathematical retrieval distance to the semantic chunk logic string payload
+                result['score'] = hit.score
+                results.append(result)
+                    
+            return results

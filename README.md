@@ -5,6 +5,11 @@ This project is a **production-grade Retrieval-Augmented Generation (RAG) system
 
 It allows users to ingest complex enterprise documents (PDF, DOCX, TXT) and crawl dynamic websites, building a unified knowledge base that can be queried with high precision.
 
+### Layer-Wise Architecture Data Flow
+*(The following diagram visually maps the precise physical inputs and structural outputs transmitted across each logical layer of the RAG system.)*
+
+![Layer-Wise Execution Architecture](./assets/architecture_layered.png)
+
 ## ✨ Comprehensive Key Features
 - **Deterministic Multi-Agent Orchestration**: Powered by **LangGraph** to maintain robust `AgentState` dictionaries, strictly preventing runtime hallucinations and bounding LLM logic through an explicit DAG topology.
 - **Micro-Model Supervisor Routing**: Triages user intent instantly (<0.0s) using high-speed, lightweight models (`llama-3.1-8b-instant`) to either bypass the database for smalltalk or engage the heavy RAG analytics.
@@ -14,6 +19,8 @@ It allows users to ingest complex enterprise documents (PDF, DOCX, TXT) and craw
 - **Token-Aware Chunking**: Abandons arbitrary word counts in favor of `RecursiveCharacterTextSplitter`, physically aligning text segments with LLM context windows to prevent data truncation.
 - **Enterprise Traceability**: Fully embedded telemetry engine exporting detailed JSONL audit logs capturing every token cost, API latency, routing path, and hallucination verdict.
 - **Reactive UI Portal**: Built entirely in **Streamlit**, functioning as an interactive SaaS dashboard mapping dynamic progress bars, multi-modal file uploads, and continuous background ingestion loops.
+- **Hardware Agnostic Runtime**: Actively probes compute capabilities at launch, automatically mapping tensor operations to `CUDA` or CPU threads natively, and leverages heavy ThreadPool executors to unblock the main FastAPI async loops.
+- **Model Agnostic Framework**: Every inference module natively accepts dynamic `model_override` parameters, enabling immediate integration of future releases like Llama4 or GPT-5 without refactoring core logic graphs.
 
 ## 🏗️ Project Architecture
 
@@ -50,12 +57,13 @@ enterprise-rag-agent/
 | Component | Tech | Reason for Choice |
 | :--- | :--- | :--- |
 | **Language** | Python 3.11 | Industry standard for AI/ML engineering. |
-| **Orchestration** | LangGraph | State-based multi-agent orchestration for robust NLP routing. |
+| **Orchestration** | LangGraph | Phase 3/4: State-based multi-agent orchestration for robust NLP routing. |
 | **Frontend** | Streamlit | Rapid prototyping and interactive data visualization. |
-| **Backend API** | FastAPI | High-performance, async-native REST API (Headless SaaS Architecture). |
-| **Core Brain LLM**| Groq (`llama-3.3-70b-versatile`) | LPU architecture running at 800+ TPS. Rivals GPT-4o reasoning. |
-| **Intent/Speed LLM**| Groq (`llama-3.1-8b-instant`) | Near-instantaneous intent routing and metadata extraction logic. |
-| **Independent Verifier**| Sarvam AI (`sarvam-m`) | Secondary LLM layer to mathematically verify fact citations. |
+| **Backend API** | FastAPI | Phase 5: High-performance, async-native REST API (Headless SaaS Architecture). |
+| **Core Brain LLM**| Groq (`llama-3.3-70b-versatile` & `gpt-oss-120b`) | Phase 8: Dynamic Reasoning Controller routing high/low complexity queries automatically to save inference tokens. |
+| **Intent/Speed LLM**| Groq (`llama-3.1-8b-instant`) | Phase 3/5: Near-instantaneous intent routing and JSON-mode metadata extraction logic. |
+| **Independent Verifier**| Sarvam AI (`sarvam-m`) | Phase 9: Secondary LLM layer to mathematically verify fact citations. |
+| **Code Execution**| Groq (`qwen/qwen3-32b`) | Phase 4: Purpose-built analytical MoE strictly handling codebase logic routing. |
 | **Embeddings** | BAAI/bge-large-en-v1.5 + Reranker | State-of-the-art open-source semantic generation. |
 | **Vector Store** | Qdrant | Scalable cloud-first vector index (Replaced flat FAISS files). |
 | **PDF Processing** | PyMuPDF (fitz) | Fastest and most accurate text extraction for PDFs. |
@@ -160,13 +168,14 @@ To run the full stack, you need to open two separate terminals.
 #### 🛠️ Step-by-Step Implementation
 1.  **State Management (LangGraph):**
     -   Implemented a strictly typed `AgentState` dictionary globally mapping `app/core/types.py`.
-    -   Secures LLM conversational history, bounding the output schema to guaranteed context parameters.
+    -   Secures LLM conversational history organically across multi-turn sessions, bounding the schema execution.
+    -   Exposes `latency_optimizations` metrics tracing the autonomous model routing.
 2.  **Supervisor Semantic Routing:**
     -   Configured the `app/supervisor/intent.py` module using `llama-3.1-8b-instant` for explicit instant triage.
     -   Seamlessly switches execution paths between bypassing retrieval for smalltalk or initiating exhaustive agentic queries.
 3.  **Specialized Domain Execution Agents:**
     -   **Smalltalk Bypass:** Natively routes via `app/supervisor/router.py` executing instant responses without querying Qdrant.
-    -   **RAG DAG Execution:** Initiates `app/agents/rag.py` to chain retrieval, synthesis (`llama-3.3-70b-versatile`), and verification (`Sarvam`).
+    -   **RAG DAG Execution:** Initiates `app/agents/rag.py` to chain retrieval, dynamic synthesis (routing `70B` or `120B` depending on complexity), and verification (`Sarvam`).
 4.  **UI Alignment & Optimization:**
     -   Streamlit UI explicitly mapped to visually render the deep execution graphs dynamically as they execute in the backend.
     -   Silenced huggingface PyTorch tensor initialization outputs to keep system logs enterprise-clean.
@@ -199,17 +208,89 @@ To run the full stack, you need to open two separate terminals.
 Below represents the exhaustive integration of the enterprise RAG standards we implemented natively into the LangGraph execution flow, strictly isolating vector similarity from intelligent reasoning.
 
 1. **Prompt Injection & Safety Guard:** Protects the execution graph from system prompt extraction and RAG poisoning using `llama-prompt-guard-2-86m`.
-2. **Prompt Rewriter / Query Expansion:** Mathematically expands ambiguous user queries (e.g., "What is it?" -> "What is the refund policy?") using historical context.
+2. **Prompt Rewriter / Query Expansion:** Mathematically expands ambiguous user queries natively utilizing `openai/gpt-oss-120b` (wrapped with defensive regex parsing for exact JSON stability).
 3. **Intent Detection Supervisor:** A high-speed classifier (`llama-3.1-8b-instant`) strictly routing the execution state without blocking the async API loop.
 4. **Agent Dispatch / Smalltalk Bypass:** Routes trivial greetings to a lightweight responder, bypassing the expensive vector database.
-5. **Dynamic Metadata Extraction:** Leverages `qwen-32b` to parse the user's natural language into strict JSON `$eq` filters, mapping directly to Qdrant payloads.
+5. **Dynamic Metadata Extraction:** Leverages `llama-3.1-8b-instant` to stably parse the user's natural language into strict JSON `$eq` filters, mapping directly to Qdrant payloads.
 6. **Vector Similarity Search (Top 30):** Executes a high-recall L2 Cosine Distance search utilizing `BAAI/bge-large-en-v1.5` embeddings on the GPU.
-7. **Cross-Encoder Reranking (Top 5):** Evaluates the top 30 chunks through a rigorous semantic cross-encoder algorithm, discarding hallucination risks and returning strictly the Top 5.
-8. **Core Reasoning Synthesis:** The `llama-3.3-70b-versatile` master logical engine ingests the 5 verified chunks and structures a coherent JSON payload.
-9. **Independent Fact Verifier:** A sovereign model (`Sarvam M`) audits the generated text line-by-line exclusively against the source chunks, redacting unsourced claims.
+7. **Cross-Encoder Reranking (Top 5):** Evaluates the top 30 chunks through a rigorous semantic cross-encoder algorithm. We strictly apply a Math Sigmoid Activation function `1 / (1 + math.exp(-logit))` to transform raw pipeline logits into bounds checking >0.35 probability before truncating down to Top 5.
+8. **Core Reasoning Synthesis (Dynamic Routing):** A discrete Complexity Analyzer logic gate dictates generation. If the query exhibits intense reasoning demands (Word counts >40 or multi-hop logic gates like "contrast/analyze"), execution overrides instantly to `openai/gpt-oss-120b`. Otherwise, it falls back to the low-latency `llama-3.3-70b-versatile`.
+9. **Independent Fact Verifier:** A sovereign model (`Sarvam M`) audits the generated text line-by-line exclusively against the source chunks, redacting unsourced claims natively mapping visually onto UI strikethroughs.
 10. **Formatter & Citation Modeler:** Injects physical markdown URL and Document links natively into the structured stream response for Streamlit UI rendering.
-11. **Telemetry & RLHF Auditing:** Traps latency matrices, token bounds, and hallucination verdicts natively into the `audit_logs.jsonl` pipeline.
+11. **Telemetry & RLHF Auditing:** Traps latency matrices, token bounds, dynamic routing models, and hallucination verdicts natively into the `audit_logs.jsonl` pipeline.
 
 ### Visual Architecture Diagram (The Execution DAG)
 
 ![11-Step RAG Execution Architecture](./assets/architecture_11_steps.png)
+
+### Strict Step-By-Step Execution Flow
+
+To ensure complete understanding of the pipeline's deterministic routing, here is the exact input/output life cycle of a conversational turn:
+
+1. **User Payload [Input: `JSON` -> Layer: HTTP API]**
+   - The client system inputs a JSON payload directly into the `/api/v1/chat` Swagger/API endpoint.
+   ![Step 1: HTTP API Ingestion](./assets/step01_http_api_ingestion.png)
+2. **Security Interception [Input: `str` -> Layer: Prompt Guard (`llama-prompt-guard-2-86m`)]**
+   - **Action:** Mathematically screens for adversarial structure or data poisoning attempts.
+   - **Output [Boolean + Category]:** If `is_malicious=True`, the DAG short-circuits and immediately returns an HTTP 403 Security Exception.
+   ![Step 2: Prompt Guard Security](./assets/step02_prompt_guard_security.png)
+3. **Query Expansion [Input: `str` -> Layer: Prompt Rewriter (`gpt-oss-120b`)]**
+   - **Action:** Ingests previous conversational turns and synthesizes ambiguous queries (e.g., "how much does it cost?") into standalone logical sentences based on history.
+   - **Output [JSON payload]:** Optimized standard and deep reasoning variants of the prompt.
+   ![Step 3: Query Expansion Rewriter](./assets/step03_query_expansion_rewriter.png)
+4. **Semantic Triage [Input: `str` -> Layer: Intent Supervisor (`llama-3.1-8b-instant`)]**
+   - **Action:** Triggers an ultra-fast classification against the query to define its rigid `AgentState` intent.
+   - **Output [Enum String]:** `"rag_question"`, `"greeting"`, `"code_request"`, or `"out_of_scope"`.
+   ![Step 4: Semantic Intent Triage](./assets/step04_semantic_intent_triage.png)
+5. **Path Divergence [Input: `Enum String` -> Layer: DAG Controller]**
+   - **Action:** If `"greeting"`, instantly returns a lightweight JSON response payload. If `"code_request"`, routes directly to the specialized `qwen-32b` analytical MoE.
+   ![Step 5: DAG Path Divergence](./assets/step05_dag_path_divergence.png)
+6. **Query Grounding [Input: `str` -> Layer: Metadata Extractor (`llama-3.1-8b-instant`)]**
+   - **Action:** Analyzes the prompt for natural language bounds (e.g. "Only documents from 2024 about engineering") and parses them into strict JSON `$eq` objects.
+   - **Output [JSON Schema]:** Strictly formatted `models.Filter` maps.
+   ![Step 6: Metadata Filter Extraction](./assets/step06_metadata_filter_extraction.png)
+7. **Similarity Search [Input: `str` + `JSON` -> Layer: Qdrant Database]**
+   - **Action:** Generates an embedding tensor via `BAAI/bge-large-en` and queries Qdrant DB for the 30 semantically closest L2 distances, restricted by the applied metadata bounds.
+   - **Output [List[Dict]]:** 30 raw chunks of enterprise text data.
+   ![Step 7: Qdrant Similarity Search](./assets/step07_qdrant_similarity_search.png)
+8. **Mathematical Pruning [Input: `List[Dict]` -> Layer: Cross-Encoder Reranker]**
+   - **Action:** Forces a semantic logic matrix across all 30 chunks, outputting raw numerical logits. A mathematical Sigmoid expansion function converts logits to rigorous `0.0-1.0` probabilities, dumping anything `< 0.35` threshold.
+   - **Output [List[Dict]]:** The absolute most vital 5 text chunks.
+   ![Step 8: Cross-Encoder Reranker](./assets/step08_cross_encoder_reranker.png)
+9. **Heuristic Engine Control [Input: `str` + `int` -> Layer: Complexity Analyzer]**
+   - **Action:** Sweeps the query length, multiple logic hops ("compare/analyze"), and array density.
+   - **Output [Target Model]:** Overrides routing. Triggers `gpt-oss-120b` if intensive, otherwise defaults to `llama-3.3-70b-versatile` to heavily stabilize latency.
+   ![Step 9: Complexity Heuristic Analyzer](./assets/step09_complexity_heuristic_analyzer.png)
+10. **Native Synthesis [Input: `str` + `List[Dict]` + `Model` -> Layer: Reasoning API]**
+    - **Action:** Blocks the target LLM strictly forcing it to build an answer derived solely from the 5 validated chunks.
+    - **Output [JSON String]:** The formatted RAG answer, Confidence score % (0.0-1.0), and chunk provenance integers.
+    ![Step 10: Reasoning Synthesis](./assets/step10_reasoning_synthesis.png)
+11. **Hallucination Redaction [Input: `JSON String` + `List[Dict]` -> Layer: Fact Verifier (`Sarvam M`)]**
+    - **Action:** Computes a secondary sovereign inference sweep, isolating every generated sentence and mapping it back against the source 5 chunks.
+    - **Output [Boolean + Array]:** Any logic leaps are captured, setting `is_hallucinated=True` and returning unsupported claims.
+    ![Step 11: Sarvam Fact Verifier](./assets/step11_sarvam_fact_verifier.png)
+12. **API JSON Construction [Input: `AgentState` -> Layer: Model Formatter]**
+    - **Action:** Formats the final RAG answer, telemetry diagnostics, chat history, and provenance metadata into a strict Pydantic model dictionary array for network transmission.
+    - **Output [FastAPI Response]:** A structured JSON HTTP 200 response returned natively to the API caller.
+    ![Step 12: JSON API Formatter](./assets/step12_json_api_formatter.png)
+
+---
+
+## 🛑 Operational Challenges & Advanced Resolutions
+*The following documents critical friction points tackled during stabilization of the Enterprise Stack.*
+
+### 1. Stateless LangGraph Execution Paths
+**Challenge:** Early iterations of the FastAPI payload successfully accepted conversational `chat_history` lists from the Streamlit UI, however, the Agentic Orchestrator (`app/supervisor/router.py`) routinely initialized an empty semantic array into the graph on execution. This completely wiped conversational retention from the LLM across multi-turn queries.
+**Resolution:** The core `invoke` and `ainvoke` mappings were rewritten to natively unpack the user query and forcefully append both the user's string and the LLM's final generated logic sequentially back into the global `AgentState` dictionary before executing the final return constraint.
+
+### 2. Catastrophic Metadata Dropping via Model Incompatibility
+**Challenge:** The initial Extractor iteration deployed `qwen/qwen-2.5-32b` utilizing Groq's API and explicitly mandated a generic JSON format `response_format={"type": "json_object"}`. Groq API strictly isolates its managed JSON-mode architecture natively supporting only Llama3 and GPT-OSS models. This generated violent `JSONDecodeError` failures, causing the application to execute defensive exception blocks that effectively eradicated metadata routing from the Vector DB search arrays.
+**Resolution:** By rigorously consulting the **Groq API Documentation**, we identified that strictly formatted `{"type": "json_object"}` payloads are architecturally unsupported natively by their proprietary Qwen MoE endpoints. Consequently, the architecture was dynamically overridden. The Extractor and Rewriters were upgraded to heavily JSON-stabilized structures (`llama-3.1-8b-instant` and `gpt-oss-120b`). Additionally, a deep defensive `import re` regular expression fallback was implemented instantly caching any payloads hallucinogenically wrapping native JSON inside Markdown ( \```json ... \``` ).
+
+### 3. Native Reranker Logit Truncation Collisions
+**Challenge:** The local BAAI Cross-Encoder executed flawlessly, predicting distances on 30 vector nodes. However, the legacy script arbitrarily bounded `score > 0.35` straight against the raw generated predictions (Logits), which mathematically represent wildly unbounded raw values (-5.2 -> 8.5). This resulted in highly correct context bounds being immediately wiped mathematically leading to a catastrophic `[]` zero-chunk pipeline.
+**Resolution:** We integrated absolute `math.exp()` normalizations. The raw model bounds were directly encapsulated inside a **Sigmoid Activation Function** `probability = 1 / (1 + math.exp(-logit))` instantly correcting the unbounded logits into pristine bounded decimals `0.0 -> 1.0` allowing the `< 0.35` prune function to accurately delete hallucinations without destroying context logic.
+
+### 4. Spiking Inference Costs on Massive Concurrency 
+**Challenge:** Initially locking the synthesis engine to `llama-3.3-70b-versatile` guaranteed maximum accuracy. However, sending small contextual responses across 100 concurrent workers forced extensive latency generation locks inside Groq.
+**Resolution:** Deployed a discrete, heuristic-driven **Complexity Analyzer** natively into the RAG routing loop at Step 9. We systematically evaluate the exact raw token input structure, semantic depth constraints, and multi-hop triggers prior to generating the RAG output. We aggressively route standard generation queries to the extremely low-latency `llama-3.3-70b-versatile`, while preserving and upgrading intensive analytical arrays to the highly compute-dense logic constraints of `gpt-oss-120b`, saving tokens dynamically.

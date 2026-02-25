@@ -5,7 +5,7 @@ graph LR
     %% Core Components
     subgraph Orcehstrator [app/supervisor/]
         Router{app/supervisor/<br/>intent.py}
-        Groq8B((Groq:<br/>llama-3.1-8b))
+        Groq8B((Groq:<br/>llama-3.1-8b-instant))
     end
 
     subgraph Phase4 [app/agents/]

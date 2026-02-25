@@ -10,8 +10,9 @@ By applying these filters BEFORE the semantic search, we drastically reduce hall
 import os
 import json
 import logging
-import requests
 from typing import Dict, Any
+from tenacity import retry, wait_exponential, stop_after_attempt
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +21,9 @@ class MetadataExtractor:
     Translates Ambiguous Human Queries -> Strict Qdrant Filter Schemas.
     """
     
-    def __init__(self, model_override: str = "qwen-2.5-coder-32b"):
+    def __init__(self, model_override: str = "llama-3.1-8b-instant"):
         self.api_key = os.getenv("GROQ_API_KEY")
-        # Ensure we use an explicitly supported coder/analytical model on Groq
-        self.model_id = "qwen-2.5-32b" if "coder" not in model_override else "qwen-2.5-coder-32b"
+        self.model_id = model_override
         
         # We explicitly supply the metadata fields the database actually possesses
         self.available_fields = [
@@ -51,7 +51,8 @@ Rules:
 - Example: "Show 2022 revenue from the wiki" -> {{"filters": {{"creation_year": {{"op": "$eq", "value": "2022"}}, "source_domain": {{"op": "$eq", "value": "internal_wiki"}}}}}}
 '''
 
-    def extract_filters(self, user_prompt: str) -> Dict[str, Any]:
+    @retry(wait=wait_exponential(multiplier=1, min=2, max=6), stop=stop_after_attempt(3))
+    async def extract_filters(self, user_prompt: str) -> Dict[str, Any]:
         """
         Synthesizes the JSON Object mapping for the Qdrant Filter Builder.
         
@@ -84,18 +85,47 @@ Rules:
         
         try:
             logger.info(f"[METADATA] Extracting filters dynamically via {self.model_id}...")
-            response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=8)
-            response.raise_for_status()
-            
-            raw_content = response.json()["choices"][0]["message"]["content"]
-            result = json.loads(raw_content)
-            
-            extracted_filters = result.get("filters", {})
-            if extracted_filters:
-                 logger.info(f"[METADATA] Successfully parsed dynamic boundaries: {extracted_filters}")
-            
-            return result
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=10
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    raw_content = data["choices"][0]["message"]["content"]
+                    
+                    try:
+                        result = json.loads(raw_content)
+                    except json.JSONDecodeError:
+                        # Fallback extraction in case model wraps payload in markdown backticks
+                        import re
+                        match = re.search(r"```(?:json)?\n(.*?)\n```", raw_content, re.DOTALL)
+                        if match:
+                            result = json.loads(match.group(1))
+                        else:
+                            result = {}
+                    
+                    extracted_filters = result.get("filters", {})
+                    
+                    # Explicit Validation: Purge hallucinated DB Fields proactively
+                    safe_filters = {}
+                    for field, config in extracted_filters.items():
+                        if field in self.available_fields and isinstance(config, dict) and "op" in config and "value" in config:
+                            safe_filters[field] = config
+                        else:
+                            logger.warning(f"[METADATA] Purged Hallucinated Schema Boundary: {field}")
+                            
+                    result["filters"] = safe_filters
+                    
+                    if safe_filters:
+                         logger.info(f"[METADATA] Successfully parsed dynamic boundaries: {safe_filters}")
+                    
+                    return result
             
         except Exception as e:
              logger.error(f"[METADATA] Failure extracting Schema JSON. Reverting to unfiltered semantic wide-search: {e}")
              return {"filters": {}, "confidence": 0.0, "extracted_from": "Error Exception Fallback"}
+

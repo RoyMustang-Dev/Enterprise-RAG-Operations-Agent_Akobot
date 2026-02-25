@@ -1,0 +1,58 @@
+graph TD
+    %% Global Styling
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef core fill:#e8f5e9,stroke:#388e3c,stroke-width:2px;
+    classDef agent fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef storage fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+    classDef verify fill:#ffebee,stroke:#c62828,stroke-width:2px;
+    classDef highlight fill:#e8eaf6,stroke:#3f51b5,stroke-width:3px;
+
+    %% 1. Guard
+    User((User Input)) --> Guard{1. Prompt Guard<br/>llama-prompt-guard}
+    class User input;
+    class Guard verify;
+
+    %% 2. Rewriter
+    Guard -->|Safe| Rewriter[2. Prompt Rewriter<br/>gpt-oss-120b]
+    Guard -->|Malicious| Reject((Block))
+    class Rewriter agent;
+
+    %% 3. Intent & 4. Dispatch
+    Rewriter --> Intent{3. Intent Supervisor<br/>llama-3.1-8b}
+    class Intent core;
+    
+    Intent -->|Smalltalk| Bypass[4. Bypass Responder]
+    Intent -->|Code/Analytics| Coder[4. MoE Coder<br/>qwen3-32b]
+    class Bypass,Coder agent;
+
+    %% 5. Metadata
+    Intent -->|RAG Query| Metadata[5. Metadata Extractor<br/>llama-3.1-8b]
+    class Metadata agent;
+
+    %% 6. Retrieval & 7. Rerank
+    Metadata --> VectorDB[(6. Qdrant Search<br/>Top 30 Chunks)]
+    class VectorDB storage;
+    
+    VectorDB --> Rerank{7. Cross-Encoder<br/>Rerank Top 5}
+    class Rerank core;
+
+    %% 8. Synthesis (Dynamic Routing)
+    Rerank --> Complexity{Complexity<br/>Analyzer}
+    Complexity -->|Low/Medium| Synth70B[8. Core Synthesis<br/>llama-3.3-70b]
+    Complexity -->|High| Synth120B[8. Core Synthesis<br/>gpt-oss-120b]
+    class Complexity core;
+    class Synth70B,Synth120B highlight;
+
+    %% 9. Verifier
+    Synth70B --> Verifier{9. Fact Verifier<br/>Sarvam M}
+    Synth120B --> Verifier
+    class Verifier verify;
+
+    %% 10. Formatter & 11. Telemetry
+    Verifier --> Formatter[10. Markup Formatter]
+    Formatter --> Telemetry[(11. Telemetry / RLHF<br/>audit_logs.jsonl)]
+    class Formatter agent;
+    class Telemetry storage;
+    
+    Telemetry --> Output((Final JSON Response))
+    class Output input;

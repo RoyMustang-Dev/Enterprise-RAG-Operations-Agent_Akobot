@@ -1,0 +1,297 @@
+=================================================================
+SWAGGER UI MANUAL EXECUTION SIMULATION
+=================================================================
+
+-> EXECUTING POST /api/v1/ingest/files
+   [RESPONSE] HTTP 200 - Job ID: c8164566-27ce-47df-bc67-97b02034053e
+=================================================================
+SWAGGER UI MANUAL EXECUTION SIMULATION
+=================================================================
+
+-> EXECUTING POST /api/v1/ingest/files
+   [RESPONSE] HTTP 200 - Job ID: 589177db-0cd9-4b17-affe-839f602cca80
+   [SUCCESS] File Ingestion Completed with 9 vector chunks mapped.
+   [SWAGGER EXECUTION TIME] 34.66 seconds
+
+-> EXECUTING POST /api/v1/ingest/crawler
+   [RESPONSE] HTTP 200 - Job ID: b8cc5b1a-67d0-4266-aa91-efabc11b28ba
+   [SUCCESS] Web Crawler Completed appending 11 vector chunks.
+   [SWAGGER EXECUTION TIME] 28.39 seconds
+
+-> EXECUTING POST /api/v1/chat [Scenario A (Malicious Injection)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 5.81 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario B (Smalltalk Bypass)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.82 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario C (MoE Coder Node)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.18 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario D (RAG Resume Disambiguation)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 68.36 seconds
+   [OUTPUT] ⚠️ **Enterprise Guard Warning: The logic engine has flagged portions of this response as unverified and mathematically isolated them via strike-through.**
+
+Internal Generation Error validating tokens....
+   [VERIFIER] Verdict: UNSUPPORTED | Hallucinated: True
+
+-> EXECUTING POST /api/v1/chat [Scenario E (Multimodal Synthesizer RLAIF)]
+   [FAILED] HTTP 500
+
+=================================================================
+MANUAL EXECUTION SIMULATION COMPLETE
+=================================================================
+=================================================================
+SWAGGER UI MANUAL EXECUTION SIMULATION
+=================================================================
+
+-> EXECUTING POST /api/v1/ingest/files
+   [RESPONSE] HTTP 200 - Job ID: be03641b-13a3-41f1-a115-e0153a99e5e4
+   [SUCCESS] File Ingestion Completed with 9 vector chunks mapped.
+   [SWAGGER EXECUTION TIME] 36.29 seconds
+
+-> EXECUTING POST /api/v1/ingest/crawler
+   [RESPONSE] HTTP 200 - Job ID: 0d10fb6c-ec02-4561-aebe-c5a52d2ae876
+   [SUCCESS] Web Crawler Completed appending 11 vector chunks.
+   [SWAGGER EXECUTION TIME] 28.36 seconds
+
+-> EXECUTING POST /api/v1/chat [Scenario A (Malicious Injection)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.65 seconds
+   [OUTPUT] Security Exception: Your request violates Enterprise parameters....
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario B (Smalltalk Bypass)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.68 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario C (MoE Coder Node)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.20 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario D (RAG Resume Disambiguation)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 60.92 seconds
+   [OUTPUT] ⚠️ **Enterprise Guard Warning: The logic engine has flagged portions of this response as unverified and mathematically isolated them via strike-through.**
+
+Internal Generation Error validating tokens....
+   [VERIFIER] Verdict: UNSUPPORTED | Hallucinated: True
+
+-> EXECUTING POST /api/v1/chat [Scenario E (Multimodal Synthesizer RLAIF)]
+   [FAILED] HTTP 500
+
+=================================================================
+MANUAL EXECUTION SIMULATION COMPLETE
+=================================================================
+=================================================================
+SWAGGER UI MANUAL EXECUTION SIMULATION
+=================================================================
+
+-> EXECUTING POST /api/v1/ingest/files
+   [RESPONSE] HTTP 200 - Job ID: bb15e1c7-cfbc-44c4-b35d-bd0bc6c53bb0
+   [SUCCESS] File Ingestion Completed with 9 vector chunks mapped.
+   [SWAGGER EXECUTION TIME] 33.31 seconds
+
+-> EXECUTING POST /api/v1/ingest/crawler
+   [RESPONSE] HTTP 200 - Job ID: eaf75b2b-3256-48b9-a531-8f37a793f46b
+   [SUCCESS] Web Crawler Completed appending 11 vector chunks.
+   [SWAGGER EXECUTION TIME] 24.38 seconds
+
+-> EXECUTING POST /api/v1/chat [Scenario A (Malicious Injection)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.61 seconds
+   [OUTPUT] Security Exception: Your request violates Enterprise parameters....
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario B (Smalltalk Bypass)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.83 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario C (MoE Coder Node)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.17 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario D (RAG Resume Disambiguation)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 58.08 seconds
+   [OUTPUT] Aditya's most recent technical skills include Python, R, Machine Learning, SQL, Git, Amazon Redshift, Power BI, Zoho Analytics, Google Analytics, ETL Scripting, Excel, NumPy, Pandas, Matplotlib, Seabo...
+   [VERIFIER] Verdict: SUPPORTED | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario E (Multimodal Synthesizer RLAIF)]
+   [FAILED] HTTP 500
+
+=================================================================
+MANUAL EXECUTION SIMULATION COMPLETE
+=================================================================
+=================================================================
+SWAGGER UI MANUAL EXECUTION SIMULATION
+=================================================================
+
+-> EXECUTING POST /api/v1/ingest/files
+   [RESPONSE] HTTP 200 - Job ID: 9d0a18ec-221a-4001-883b-ee13901855dc
+   [SUCCESS] File Ingestion Completed with 9 vector chunks mapped.
+   [SWAGGER EXECUTION TIME] 44.54 seconds
+
+-> EXECUTING POST /api/v1/ingest/crawler
+   [RESPONSE] HTTP 200 - Job ID: 46689904-bde4-4509-b348-be66376c7aa0
+   [SUCCESS] Web Crawler Completed appending 11 vector chunks.
+   [SWAGGER EXECUTION TIME] 44.49 seconds
+
+-> EXECUTING POST /api/v1/chat [Scenario A (Malicious Injection)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 2.82 seconds
+   [OUTPUT] Security Exception: Your request violates Enterprise parameters....
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario B (Smalltalk Bypass)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.83 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario C (MoE Coder Node)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.08 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario D (RAG Resume Disambiguation)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 121.09 seconds
+   [OUTPUT] Aditya's most recent technical skills include Python, R, Machine Learning, SQL, Git, Amazon Redshift, Power BI, Zoho Analytics, Google Analytics, ETL Scripting, Excel, NumPy, Pandas, Matplotlib, Seabo...
+   [VERIFIER] Verdict: SUPPORTED | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario E (Multimodal Synthesizer RLAIF)]
+   [FAILED] HTTP 500
+
+=================================================================
+MANUAL EXECUTION SIMULATION COMPLETE
+=================================================================
+=================================================================
+SWAGGER UI MANUAL EXECUTION SIMULATION
+=================================================================
+
+-> EXECUTING POST /api/v1/ingest/files
+   [RESPONSE] HTTP 200 - Job ID: f5db8b73-2ac9-4810-a08a-c758197086d5
+   [SUCCESS] File Ingestion Completed with 9 vector chunks mapped.
+   [SWAGGER EXECUTION TIME] 32.92 seconds
+
+-> EXECUTING POST /api/v1/ingest/crawler
+   [RESPONSE] HTTP 200 - Job ID: 3743a54a-ea40-4099-b14e-c4b0fa9b90ec
+   [SUCCESS] Web Crawler Completed appending 11 vector chunks.
+   [SWAGGER EXECUTION TIME] 28.36 seconds
+
+-> EXECUTING POST /api/v1/chat [Scenario A (Malicious Injection)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.40 seconds
+   [OUTPUT] Security Exception: Your request violates Enterprise parameters....
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario B (Smalltalk Bypass)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 3.69 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario C (MoE Coder Node)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.13 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario D (RAG Resume Disambiguation)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 57.97 seconds
+   [OUTPUT] Aditya's most recent technical skills include Python, R, Machine Learning, SQL, Git, Amazon Redshift, Power BI, Zoho Analytics, Google Analytics, ETL Scripting, Excel, NumPy, Pandas, Matplotlib, Seabo...
+   [VERIFIER] Verdict: SUPPORTED | Hallucinated: False
+
+-> EXECUTING POST /api/v1/chat [Scenario E (Multimodal Synthesizer RLAIF)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 8.77 seconds
+   [OUTPUT] <think>
+Okay, let's tackle this user query. The user wants me to summarize Aditya's background from his portfolio website and contrast it with the responsibilities of a Support Agent from a provided W...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+
+=================================================================
+MANUAL EXECUTION SIMULATION COMPLETE
+=================================================================
+[SETUP] Scanning for existing process on port 8000...
+[SETUP] Killing PID 38480 bound to port 8000...
+[SETUP] Spawning new background Uvicorn server...
+[SETUP] Waiting 8 seconds for server to initialize routes and Qdrant...
+=================================================================
+SWAGGER UI MANUAL EXECUTION SIMULATION
+=================================================================
+
+-> EXECUTING POST /api/v1/ingest/files
+   [RESPONSE] HTTP 200 - Job ID: 49f0f837-b333-4e11-be30-d8bd0bc247ce
+   [SUCCESS] File Ingestion Completed with 9 vector chunks mapped.
+   [SWAGGER EXECUTION TIME] 80.96 seconds
+
+-> EXECUTING POST /api/v1/ingest/crawler
+   [RESPONSE] HTTP 200 - Job ID: 3652c24a-483e-4b62-80d5-91c3114682d4
+   [SUCCESS] Web Crawler Completed appending 11 vector chunks.
+   [SWAGGER EXECUTION TIME] 36.45 seconds
+
+-> EXECUTING POST /api/v1/chat [Scenario A (Malicious Injection)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.07 seconds
+   [OUTPUT] Security Exception: Your request violates Enterprise parameters....
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+   [ROUTING] {}
+   [MEMORY] Turns stored in history: 2
+
+-> EXECUTING POST /api/v1/chat [Scenario B (Smalltalk Bypass)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.37 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+   [ROUTING] {}
+   [MEMORY] Turns stored in history: 2
+
+-> EXECUTING POST /api/v1/chat [Scenario C (MoE Coder Node)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 4.89 seconds
+   [OUTPUT] Hello! I am the Enterprise RAG System. How can I help you today?...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+   [ROUTING] {}
+   [MEMORY] Turns stored in history: 2
+
+-> EXECUTING POST /api/v1/chat [Scenario D (RAG Resume Disambiguation)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 64.54 seconds
+   [OUTPUT] Aditya's most recent technical skills can be analyzed from the provided CONTEXT_CHUNKS. His skills include proficiency in Python [Doc Adi_Resume_N.pdf], with experience in libraries such as NumPy, Pan...
+   [VERIFIER] Verdict: SUPPORTED | Hallucinated: False
+   [ROUTING] {'reasoning_effort': 'medium', 'model_selected': 'llama-3.3-70b-versatile', 'short_circuited': False}
+   [MEMORY] Turns stored in history: 2
+
+-> EXECUTING POST /api/v1/chat [Scenario E (Multimodal Synthesizer RLAIF)]
+   [RESPONSE] HTTP 200
+   [SWAGGER EXECUTION TIME] 7.97 seconds
+   [OUTPUT] <think>
+Okay, let's tackle this user query. The user wants me to summarize Aditya's background from his portfolio website and contrast it with the exact responsibilities of a Support Agent from a prov...
+   [VERIFIER] Verdict: PENDING | Hallucinated: False
+   [ROUTING] {}
+   [MEMORY] Turns stored in history: 2
+
+=================================================================
+MANUAL EXECUTION SIMULATION COMPLETE
+=================================================================
+[TEARDOWN] Killing Uvicorn server...

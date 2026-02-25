@@ -1,0 +1,5 @@
+graph LR
+  A([Input: Query String]) --> B{Prompt Guard Layer}
+  B -->|Malicious| C([Output: HTTP 403 Security Exception])
+  B -->|Safe| D([Output: Safe String])
+  style B fill:#ffebee,stroke:#c62828

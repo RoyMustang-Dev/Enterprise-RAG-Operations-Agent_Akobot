@@ -10,8 +10,10 @@ from typing import Dict, Any
 
 from app.core.types import AgentState
 from app.prompt_engine.guard import PromptInjectionGuard
+from app.prompt_engine.rewriter import PromptRewriter
 from app.supervisor.intent import IntentClassifier
 from app.agents.rag import RAGAgent
+from app.agents.coder import CoderAgent
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +28,12 @@ class ExecutionGraph:
         Instantiates the immutable middleware layers that execute on every single request.
         """
         self.guard = PromptInjectionGuard()
+        self.rewriter = PromptRewriter()
         self.classifier = IntentClassifier()
         self.rag_agent = RAGAgent()
+        self.coder_agent = CoderAgent()
         
-    def invoke(self, query: str, chat_history: list = None) -> AgentState:
+    async def invoke(self, query: str, chat_history: list = None) -> AgentState:
         """
         The formal entrypoint called by `app.api.routes`.
         
@@ -41,9 +45,12 @@ class ExecutionGraph:
             AgentState: The fully completed dictionary containing the final grounded answer.
         """
         # Initialize the global TypedDict scope
+        safe_history = chat_history or []
+        safe_history.append({"role": "user", "content": query})
+        
         state: AgentState = {
             "query": query,
-            "chat_history": chat_history or [],
+            "chat_history": safe_history,
             "intent": None,
             "search_query": None,
             "context_chunks": [],
@@ -52,8 +59,11 @@ class ExecutionGraph:
             "verifier_verdict": "PENDING",
             "is_hallucinated": False,
             "optimizations": {},
+            "optimized_prompts": {},
             "answer": "",
-            "sources": []
+            "sources": [],
+            "reasoning_effort": "low",
+            "latency_optimizations": {}
         }
         
         # -------------------------------------------------------------
@@ -61,33 +71,60 @@ class ExecutionGraph:
         # -------------------------------------------------------------
         safety_report = self.guard.evaluate(query)
         if safety_report.get("is_malicious", False):
-            logger.warning(f"[ROUTER] Guard intercepted payload (Soft bypass in Dev). Flagged as: {safety_report.get('categories')}")
+            logger.warning(f"[ROUTER] Guard intercepted payload. Flagged as: {safety_report.get('categories')}")
+            state["answer"] = "Security Exception: Your request violates Enterprise parameters."
+            state["confidence"] = 1.0
+            state["chat_history"].append({"role": "assistant", "content": state["answer"]})
+            return state
             
         # -------------------------------------------------------------
         # STEP 2: REASONING (Intent Classification)
         # -------------------------------------------------------------
-        intent_report = self.classifier.classify(query)
+        intent_report = await self.classifier.classify(query)
         state["intent"] = intent_report.get("intent", "rag_question")
         
         # -------------------------------------------------------------
-        # STEP 3: EXECUTION FORK (MoE / ReAct Routing)
+        # STEP 3: PROMPT OPTIMIZATION (MoE Rewriter)
         # -------------------------------------------------------------
-        if state["intent"] in ["greeting", "smalltalk", "out_of_scope"]:
-             # Bypass the expensive 70B logic completely.
-             logger.info("[ROUTER] Smalltalk Bypass executing via Llama-8B.")
-             # [PHASE 5 MOCK] - Execute `app.agents.smalltalk_agent`
-             state["answer"] = "Hello! I am the Enterprise RAG System. How can I help you today?"
-             state["confidence"] = 0.99
+        # Generate 3 canonical prompts with explicit Temp/Token Metadata
+        rewrite_data = await self.rewriter.rewrite(query, state["intent"])
+        state["optimized_prompts"] = rewrite_data.get("prompts", {})
+        
+        # -------------------------------------------------------------
+        # STEP 4: EXECUTION FORK (MoE / ReAct Routing)
+        # -------------------------------------------------------------
+        if state["intent"] == "out_of_scope":
+             logger.info("[ROUTER] Out_of_scope Intent Bypass executing.")
+             state["answer"] = "I am unable to answer this question based on the provided enterprise context."
+             state["confidence"] = 1.0
+             state["chat_history"].append({"role": "assistant", "content": state["answer"]})
              return state
              
-        elif state["intent"] in ["rag_question", "analytics_request", "code_request"]:
+        elif state["intent"] in ["greeting", "smalltalk"]:
+             # Bypass the expensive 70B logic completely.
+             logger.info("[ROUTER] Smalltalk Bypass executing via Llama-8B.")
+             state["answer"] = "Hello! I am the Enterprise RAG System. How can I help you today?"
+             state["confidence"] = 0.99
+             state["chat_history"].append({"role": "assistant", "content": state["answer"]})
+             return state
+             
+        elif state["intent"] in ["code_request", "analytics_request"]:
+             logger.info(f"[ROUTER] Dispatching payload to the {state['intent']} Coder Agent.")
+             # We execute solely against the Coder MoE ignoring dense 70B RAG chains
+             final_state = await self.coder_agent.ainvoke(state)
+             final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
+             return final_state
+             
+        elif state["intent"] == "rag_question":
              # Dispatch into the heavy machinery
-             logger.info("[ROUTER] Dispatching payload to the dense RAG/Coder agents.")
+             logger.info("[ROUTER] Dispatching payload to the dense RAG agent.")
              
              # Execute the end-to-end RAG pipeline
-             final_state = self.rag_agent.invoke(state)
+             final_state = await self.rag_agent.ainvoke(state)
+             final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
              return final_state
         
         # Failsafe Catch-all
         state["answer"] = "I am unsure how to route this specific query format."
+        state["chat_history"].append({"role": "assistant", "content": state["answer"]})
         return state

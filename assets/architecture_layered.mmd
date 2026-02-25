@@ -1,0 +1,115 @@
+graph TD
+    %% Styling
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#212529;
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef core fill:#e8f5e9,stroke:#388e3c,stroke-width:2px;
+    classDef storage fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+    classDef agent fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef verify fill:#ffebee,stroke:#c62828,stroke-width:2px;
+    classDef highlight fill:#e8eaf6,stroke:#3f51b5,stroke-width:3px;
+    classDef data fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+
+    subgraph Layer1 [Layer 1: Document Uploads]
+        direction TB
+        DocInput([Input: PDF, DOCX, TXT]) --> DocLoader[PyMuPDF Loader]
+        DocLoader_Out([Output: Raw Document Text])
+        DocLoader --> DocLoader_Out
+    end
+
+    subgraph Layer2 [Layer 2: Web Crawler]
+        direction TB
+        WebInput([Input: URL Targets]) --> WebCrawler[Playwright Spider]
+        WebCrawler_Out([Output: Scraped HTML/Text])
+        WebCrawler --> WebCrawler_Out
+    end
+
+    subgraph Layer3 [Layer 3: Knowledge Base Generation]
+        direction TB
+        DocLoader_Out -.-> |"Extract"| Chunker[RecursiveCharacterTextSplitter]
+        WebCrawler_Out -.-> |"Extract"| Chunker
+        Chunker_Out([Output: Token-Aware Chunks])
+        Chunker --> Chunker_Out
+        
+        Chunker_Out -.-> |"Encode"| Embed[BAAI/bge-large-en Embeddings]
+        Embed_Out([Output: Vector Embeddings])
+        Embed --> Embed_Out
+        
+        Embed_Out -.-> |"Persist"| KB[(Qdrant Vector Storage)]
+    end
+
+    User([User Payload Input: string])
+
+    subgraph Layer4 [Layer 4: Security & Triage]
+        direction TB
+        L1{Prompt Guard<br/>llama-prompt-guard-2}
+        L1_Out([Output: Safe/Malicious Boolean])
+        L1 --> L1_Out
+    end
+    
+    User --> L1
+    L1_Out -.-> |"If Safe"| L2
+
+    subgraph Layer5 [Layer 5: Expansion & Routing]
+        direction TB
+        L2[Prompt Rewriter<br/>gpt-oss-120b]
+        L2_Out([Output: Expanded JSON Queries])
+        L2 --> L2_Out
+        L2_Out -.-> |"Queries"| L3{Intent Supervisor<br/>llama-3.1-8b-instant}
+        L3_Out([Output: Intent Enum])
+        L3 --> L3_Out
+    end
+
+    L3_Out -.-> |"If rag_question"| L4
+    
+    subgraph Layer6 [Layer 6: Grounding & Retrieval]
+        direction TB
+        L4[Metadata Extractor<br/>llama-3.1-8b-instant]
+        L4_Out([Output: JSON Schema Filters])
+        L4 --> L4_Out
+        
+        L4_Out -.-> |"Filters + Embedding"| L5[(Qdrant Similarity Search<br/>+ BAAI/bge-large-en)]
+        L5_Out([Output: 30 Raw Vector Chunks])
+        L5 --> L5_Out
+        
+        L5_Out -.-> |"List[Dict]"| L6{Cross-Encoder Reranker<br/>Sigmoid Math Activation}
+        L6_Out([Output: Top 5 Validated Chunks])
+        L6 --> L6_Out
+    end
+    
+    KB -.-> |"Queried by"| L5
+
+    L6_Out -.-> |"Valid Chunks"| L7
+    
+    subgraph Layer7 [Layer 7: Synthesis & Verification]
+        direction TB
+        L7{Complexity Analyzer<br/>Heuristic Engine}
+        L7_Out([Output: Target Model Route])
+        L7 --> L7_Out
+        
+        L7_Out -.-> |"Load Balance"| L8[Reasoning API Synthesis<br/>llama-3.3-70b OR gpt-oss-120b]
+        L8_Out([Output: Draft JSON Payload])
+        L8 --> L8_Out
+        
+        L8_Out -.-> |"Generated Claims"| L9{Fact Verifier<br/>Sarvam M}
+        L9_Out([Output: Hallucination Array])
+        L9 --> L9_Out
+    end
+
+    L9_Out -.-> |"Verified Draft"| L10
+    
+    subgraph Layer8 [Layer 8: Output & Telemetry]
+        direction TB
+        L10[Document Formatter<br/>FastAPI Layer]
+        L10_Out([Output: HTTP 200 Fast API Response])
+        L10 --> L10_Out
+        L11[(audit_logs.jsonl<br/>Telemetry Stream)]
+        L10 -.-> L11
+    end
+
+    %% Class Attachments
+    class DocInput,WebInput,User,DocLoader_Out,WebCrawler_Out,Chunker_Out,Embed_Out,L1_Out,L2_Out,L3_Out,L4_Out,L5_Out,L6_Out,L7_Out,L8_Out,L9_Out,L10_Out data;
+    class L1,L9 verify;
+    class DocLoader,WebCrawler,Chunker,L2,L4,L10 agent;
+    class Embed,L3,L6,L7 core;
+    class KB,L5,L11 storage;
+    class L8 highlight;

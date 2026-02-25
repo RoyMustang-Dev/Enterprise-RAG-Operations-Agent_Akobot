@@ -41,6 +41,8 @@ class ChatResponse(BaseModel):
     verifier_verdict: str
     is_hallucinated: bool
     optimizations: Dict[str, Any]
+    chat_history: Optional[List[Dict[str, Any]]] = Field(default=[])
+    latency_optimizations: Optional[Dict[str, Any]] = Field(default={})
 
 class IngestionResponse(BaseModel):
     status: str
@@ -67,7 +69,7 @@ async def chat_endpoint(request: ChatRequest):
     try:
         from app.supervisor.router import ExecutionGraph
         orchestrator = ExecutionGraph()
-        result = orchestrator.invoke(request.query, request.chat_history)
+        result = await orchestrator.invoke(request.query, request.chat_history)
         
         return ChatResponse(
             answer=result.get("answer", "No answer generated."),
@@ -75,7 +77,9 @@ async def chat_endpoint(request: ChatRequest):
             confidence=result.get("confidence", 0.0),
             verifier_verdict=result.get("verifier_verdict", "UNVERIFIED"),
             is_hallucinated=result.get("is_hallucinated", False),
-            optimizations=result.get("optimizations", {})
+            optimizations=result.get("optimizations", {}),
+            chat_history=result.get("chat_history", []),
+            latency_optimizations=result.get("latency_optimizations", {})
         )
     except Exception as e:
         logger.error(f"Chat Execution Failed: {str(e)}")
@@ -129,7 +133,8 @@ async def ingest_files_endpoint(
             pipeline.run_ingestion, 
             file_paths=file_paths, 
             metadatas=[{} for _ in files], 
-            reset_db=(mode == "overwrite")
+            reset_db=(mode == "overwrite"),
+            job_tracker=ingestion_jobs[job_id]
         )
         
         return IngestionResponse(
@@ -309,7 +314,60 @@ async def check_progress_endpoint(job_id: str):
     return job
 
 # -----------------------------------------------------------------------------
-# 5. RLHF Telemetry Endpoint
+# 5. Multimodal Audio Transcription Endpoint
+# -----------------------------------------------------------------------------
+class TranscriptionResponse(BaseModel):
+    transcript: str
+
+@router.post("/transcribe", response_model=TranscriptionResponse)
+async def transcribe_audio_endpoint(
+    audio_file: UploadFile = File(..., description="WAV/MP3/M4A Audio Stream")
+):
+    """
+    **Whisper AI STT Gateway**
+    
+    Accepts raw binary audio buffers and natively executes hyper-fast transcription utilizing 
+    the `whisper-large-v3-turbo` model over Groq API.
+    """
+    try:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="Missing GROQ API KEY explicitly for Whisper Transcription.")
+            
+        import aiohttp
+        
+        # Explicit MultiPart Form encoding required for binary proxying to Groq API
+        form = aiohttp.FormData()
+        
+        # Read file dynamically
+        file_bytes = await audio_file.read()
+        form.add_field('file',
+                       file_bytes,
+                       filename=audio_file.filename,
+                       content_type=audio_file.content_type)
+        form.add_field('model', 'whisper-large-v3-turbo')
+        form.add_field('response_format', 'json')
+        
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=headers,
+                data=form,
+                timeout=25
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+                
+                return TranscriptionResponse(transcript=result.get("text", ""))
+                
+    except Exception as e:
+        logger.error(f"STT Whisper Proxy Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Audio Signal extraction natively failed.")
+
+# -----------------------------------------------------------------------------
+# 6. RLHF Telemetry Endpoint
 # -----------------------------------------------------------------------------
 @router.post("/feedback")
 async def rlhf_feedback_endpoint(request: FeedbackRequest):

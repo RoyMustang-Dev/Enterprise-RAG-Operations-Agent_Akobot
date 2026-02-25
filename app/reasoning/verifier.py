@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class HallucinationVerifier:
     """
-    Independent Fact-Checker auditing the draft answer against the raw chunk arrays.
+    Independent Fact-Checker auditing the draft answer against the raw chunk arrays Line-by-Line.
     """
     
     def __init__(self, use_sarvam: bool = True):
@@ -25,20 +25,26 @@ class HallucinationVerifier:
         self.sarvam_key = os.getenv("SARVAM_API_KEY")
         self.groq_key = os.getenv("GROQ_API_KEY")
         
-        self.system_prompt = '''SYSTEM: You are an evidence verifier. Given a candidate answer and the CONTEXT_CHUNKS, perform the following:
+        self.system_prompt = '''SYSTEM: You are an enterprise evidence verifier. Given a candidate answer and the securely retrieved CONTEXT_CHUNKS, perform the following logic:
 
-1) For each factual claim in the answer, check if CONTEXT_CHUNKS contain supporting evidence. 
-2) Provide an overall verifier_verdict: SUPPORTED / PARTIALLY_SUPPORTED / UNSUPPORTED and a numeric score 0.00-1.00.
+1) Break the draft answer down into an array of isolated, Line-by-Line factual claims.
+2) For each factual claim, check if the CONTEXT_CHUNKS contain supporting evidence. 
+3) Provide a "verdict" for each claim: SUPPORTED / PARTIALLY_SUPPORTED / UNSUPPORTED.
+4) Calculate the "overall_verdict" based on the array of claims.
 
 Output exactly one JSON object with fields: 
 {
+  "claims": [
+     {"claim": "<exact sentence from draft>", "verdict": "SUPPORTED"}
+  ],
   "overall_verdict": "SUPPORTED",
   "score": 1.0,
   "is_hallucinated": false
 }
 
 Constraints:
-- If ANY claim is contradicted or simply missing from the text, flag "is_hallucinated": true.
+- If ANY single claim is UNSUPPORTED or missing from the chunks, flag "is_hallucinated": true.
+- Do not modify the text of the claim. Copy it exactly as written including punctuation and trailing brackets.
 '''
 
     def verify(self, draft_answer: str, context_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -55,7 +61,7 @@ Constraints:
              return self._invoke_groq_fallback(user_payload)
              
         # Scaffold Fallback
-        return {"overall_verdict": "UNVERIFIED", "score": 0.0, "is_hallucinated": False}
+        return {"overall_verdict": "UNVERIFIED", "score": 0.0, "is_hallucinated": False, "claims": []}
 
     def _invoke_groq_fallback(self, payload_str: str) -> Dict[str, Any]:
         """Executes verification using an external independent Groq Model."""
@@ -72,12 +78,12 @@ Constraints:
         
         try:
             logger.info("[VERIFIER] Executing logic boundary verification... (Groq Fallback)")
-            response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=8)
+            response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=12)
             response.raise_for_status()
             return json.loads(response.json()["choices"][0]["message"]["content"])
         except Exception as e:
             logger.error(f"[VERIFIER] Execution failure: {e}")
-            return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False}
+            return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}
             
     def _invoke_sarvam(self, payload_str: str) -> Dict[str, Any]:
         """Executes verification natively on Sarvam M."""
@@ -90,18 +96,15 @@ Constraints:
             ],
             "temperature": 0.0,
             "top_p": 1,
-            "max_tokens": 1000
+            "max_tokens": 1500
         }
         
         try:
-            logger.info("[VERIFIER] Executing logic boundary verification... (Sarvam M Native)")
-            # Using the standard Sarvam Chat completion endpoint
-            response = requests.post("https://api.sarvam.ai/v1/chat/completions", headers=headers, json=payload, timeout=10)
+            logger.info("[VERIFIER] Executing logic boundary line-by-line verification... (Sarvam M Native)")
+            response = requests.post("https://api.sarvam.ai/v1/chat/completions", headers=headers, json=payload, timeout=20)
             response.raise_for_status()
             
-            # Since Sarvam may not explicitly support JSON response_format natively, we parse defensively
             raw_text = response.json()["choices"][0]["message"]["content"]
-            # Extract JSON bound if Sarvam wraps it in markdown blocks
             if "```json" in raw_text:
                 raw_text = raw_text.split("```json")[1].split("```")[0].strip()
             elif "```" in raw_text:
@@ -112,4 +115,4 @@ Constraints:
             logger.error(f"[VERIFIER] Sarvam execution failure: {e}. Falling back to Groq natively.")
             if self.groq_key:
                 return self._invoke_groq_fallback(payload_str)
-            return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False}
+            return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}

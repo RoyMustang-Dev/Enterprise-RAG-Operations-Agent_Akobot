@@ -50,9 +50,13 @@ class AgentState(TypedDict):
     confidence: float                   # 0.00 to 1.00 numeric confidence of the answer
     verifier_verdict: str               # e.g., 'SUPPORTED', 'UNSUPPORTED'
     is_hallucinated: bool               # Boolean strict flag toggled by the verifier layer
+    verification_claims: List[Dict[str, Any]] # The parsed array of isolated sentence-level verifications
     
     # Internal Observability Trace
     optimizations: OptimizationMetrics
+    optimized_prompts: Dict[str, Any]       # The low/med/high synthesized dynamic prompts
+    reasoning_effort: str                   # dynamically computed 'low', 'medium', or 'high'
+    latency_optimizations: Dict[str, Any]   # dynamic routing metrics and latency saves
     
     # Final Output Outputs
     answer: str
