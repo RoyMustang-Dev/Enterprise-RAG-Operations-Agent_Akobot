@@ -34,6 +34,7 @@ class AgentState(TypedDict):
     Every agent mutates this state dictionary, and the final result is emitted to the FastAPI route.
     """
     # System Inputs
+    session_id: str
     query: str
     chat_history: List[Dict[str, str]]
     streaming_callback: Optional[Any]

@@ -19,7 +19,6 @@ from app.retrieval.reranker import SemanticReranker
 # Phase 5 Imports
 from app.reasoning.synthesis import SynthesisEngine
 from app.reasoning.verifier import HallucinationVerifier
-from app.reasoning.verifier import HallucinationVerifier
 from app.reasoning.formatter import ResponseFormatter
 
 # Phase 13 Imports
@@ -44,7 +43,6 @@ class RAGAgent:
         self.embedding_model = EmbeddingModel()
         self.vector_store = QdrantStore()
         self.reranker = SemanticReranker()
-        self.synthesis_engine = SynthesisEngine()
         self.synthesis_engine = SynthesisEngine()
         self.verifier = HallucinationVerifier()
         self.reward_model = OnlineRewardModel()
@@ -129,7 +127,7 @@ class RAGAgent:
         # 2. Execute L2 Distance Search (Requesting 30 chunks for high-recall)
         # Note: In a production Qdrant cloud environment, `filters` would be mapped 
         # to a `models.Filter` object here dynamically. 
-        chunks = self.vector_store.search(query_tensor, k=30)
+        chunks = self.vector_store.search(query_tensor, k=30, metadata_filters=filters)
         
         state["context_chunks"] = chunks
         
@@ -211,8 +209,12 @@ class RAGAgent:
         
         # Re-attach provenance/confidence matching the Standard result mapping globally (Mocked merge for Phase 13)
         state["answer"] = winning_answer
-        state["sources"] = result_a.get("provenance", [])
-        state["confidence"] = result_a.get("confidence", 0.95)
+        if winning_answer == result_b.get("answer", ""):
+            state["sources"] = result_b.get("provenance", [])
+            state["confidence"] = result_b.get("confidence", 0.95)
+        else:
+            state["sources"] = result_a.get("provenance", [])
+            state["confidence"] = result_a.get("confidence", 0.95)
         
         return state
 
@@ -223,7 +225,8 @@ class RAGAgent:
         
         # Offload the blocking requests.post Sarvam network call to a worker thread
         verification = await asyncio.to_thread(self.verifier.verify, draft_answer, chunks)
-        
+
+        state["verification_claims"] = verification.get("claims", [])
         state["verifier_verdict"] = verification.get("overall_verdict", "UNVERIFIED")
         state["is_hallucinated"] = verification.get("is_hallucinated", False)
         

@@ -80,6 +80,7 @@ class SynthesisEngine:
         
         context_string = ""
         cost_sum = 0
+        provenance = []
         
         # Concat context into string natively since Groq 70B no longer supports the schema
         for i, chunk in enumerate(context_chunks):
@@ -93,6 +94,13 @@ class SynthesisEngine:
             native_id = str(chunk.get("source", f"Chunk-{i}"))
             context_string += f"[Doc {native_id}]:\n{chunk_text}\n---\n"
             cost_sum += cost
+            provenance.append(
+                {
+                    "source": native_id,
+                    "score": chunk.get("score", 0.0),
+                    "text": chunk_text[:240],
+                }
+            )
             
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -120,11 +128,10 @@ class SynthesisEngine:
             
             return {
                 "answer": parsed_result.get("answer", ""),
-                # Sources can effectively be nullified here since they are intrinsically mid-sentence now
-                "provenance": [], 
+                "provenance": provenance,
                 "confidence": parsed_result.get("confidence", 0.0)
             }
             
         except Exception as e:
              logger.error(f"[SYNTHESIS] Execution completely crashed: {e}")
-             return {"answer": "Internal Generation Error validating tokens.", "provenance": [], "confidence": 0.0}
+             return {"answer": "Internal Generation Error validating tokens.", "provenance": provenance, "confidence": 0.0}

@@ -30,7 +30,8 @@ class MetadataExtractor:
             "document_type",   # e.g., 'pdf', 'docx', 'webpage'
             "source_domain",   # e.g., 'github.com', 'internal_wiki'
             "author", 
-            "creation_year"
+            "creation_year",
+            "source"
         ]
         
         self.system_prompt = f'''SYSTEM: You are a high-precision metadata extractor. Given the USER QUERY and the AVAILABLE_METADATA_FIELDS list, extract structured filters as JSON following this EXACT schema:
@@ -128,4 +129,3 @@ Rules:
         except Exception as e:
              logger.error(f"[METADATA] Failure extracting Schema JSON. Reverting to unfiltered semantic wide-search: {e}")
              return {"filters": {}, "confidence": 0.0, "extracted_from": "Error Exception Fallback"}
-

@@ -6,6 +6,7 @@ and database persistence operations into a single cohesive synchronous block.
 """
 import os
 import time
+from datetime import datetime
 from typing import List, Dict
 
 from app.ingestion.loader import load_document
@@ -79,10 +80,17 @@ class IngestionPipeline:
                 
                 # Append default tracking metadata required by the Retrieval Tool filtering logic
                 base_meta = metadatas[i] if metadatas and i < len(metadatas) else {}
+                source_name = os.path.basename(file_path)
+                ext = os.path.splitext(source_name)[1].lower().lstrip(".")
+                creation_year = str(datetime.utcnow().year)
                 base_meta.update({
-                    "source": os.path.basename(file_path),
+                    "source": source_name,
                     "file_path": file_path,
-                    "ingested_at": time.time()
+                    "ingested_at": time.time(),
+                    "document_type": ext or "txt",
+                    "source_domain": base_meta.get("source_domain", "uploaded_file"),
+                    "author": base_meta.get("author", "unknown"),
+                    "creation_year": str(base_meta.get("creation_year", creation_year)),
                 })
                 
                 # Flatten the data struct

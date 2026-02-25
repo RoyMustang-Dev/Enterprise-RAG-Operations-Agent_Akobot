@@ -6,6 +6,7 @@ It acts as the single entrypoint for the `/chat` route. It physically passes the
 dictionary down the pipe, running the Guard -> Intent -> RAG or Smalltalk sequence.
 """
 import logging
+import asyncio
 from typing import Dict, Any
 
 from app.core.types import AgentState
@@ -33,7 +34,7 @@ class ExecutionGraph:
         self.rag_agent = RAGAgent()
         self.coder_agent = CoderAgent()
         
-    async def invoke(self, query: str, chat_history: list = None) -> AgentState:
+    async def invoke(self, query: str, chat_history: list = None, session_id: str = "", model_provider: str = "groq") -> AgentState:
         """
         The formal entrypoint called by `app.api.routes`.
         
@@ -49,8 +50,10 @@ class ExecutionGraph:
         safe_history.append({"role": "user", "content": query})
         
         state: AgentState = {
+            "session_id": session_id,
             "query": query,
             "chat_history": safe_history,
+            "streaming_callback": None,
             "intent": None,
             "search_query": None,
             "context_chunks": [],
@@ -58,6 +61,7 @@ class ExecutionGraph:
             "confidence": 0.0,
             "verifier_verdict": "PENDING",
             "is_hallucinated": False,
+            "verification_claims": [],
             "optimizations": {},
             "optimized_prompts": {},
             "answer": "",
@@ -65,11 +69,13 @@ class ExecutionGraph:
             "reasoning_effort": "low",
             "latency_optimizations": {}
         }
+        state["optimizations"]["model_provider"] = model_provider
         
         # -------------------------------------------------------------
         # STEP 1: SAFETY (Prompt Injection Guard)
         # -------------------------------------------------------------
-        safety_report = self.guard.evaluate(query)
+        # Guard uses blocking HTTP; offload to thread so API event loop stays responsive.
+        safety_report = await asyncio.to_thread(self.guard.evaluate, query)
         if safety_report.get("is_malicious", False):
             logger.warning(f"[ROUTER] Guard intercepted payload. Flagged as: {safety_report.get('categories')}")
             state["answer"] = "Security Exception: Your request violates Enterprise parameters."
@@ -95,6 +101,7 @@ class ExecutionGraph:
         # -------------------------------------------------------------
         if state["intent"] == "out_of_scope":
              logger.info("[ROUTER] Out_of_scope Intent Bypass executing.")
+             state["optimizations"]["agent_routed"] = "out_of_scope_bypass"
              state["answer"] = "I am unable to answer this question based on the provided enterprise context."
              state["confidence"] = 1.0
              state["chat_history"].append({"role": "assistant", "content": state["answer"]})
@@ -103,6 +110,7 @@ class ExecutionGraph:
         elif state["intent"] in ["greeting", "smalltalk"]:
              # Bypass the expensive 70B logic completely.
              logger.info("[ROUTER] Smalltalk Bypass executing via Llama-8B.")
+             state["optimizations"]["agent_routed"] = "smalltalk_bypass"
              state["answer"] = "Hello! I am the Enterprise RAG System. How can I help you today?"
              state["confidence"] = 0.99
              state["chat_history"].append({"role": "assistant", "content": state["answer"]})
@@ -110,6 +118,7 @@ class ExecutionGraph:
              
         elif state["intent"] in ["code_request", "analytics_request"]:
              logger.info(f"[ROUTER] Dispatching payload to the {state['intent']} Coder Agent.")
+             state["optimizations"]["agent_routed"] = "coder_agent"
              # We execute solely against the Coder MoE ignoring dense 70B RAG chains
              final_state = await self.coder_agent.ainvoke(state)
              final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
@@ -118,6 +127,7 @@ class ExecutionGraph:
         elif state["intent"] == "rag_question":
              # Dispatch into the heavy machinery
              logger.info("[ROUTER] Dispatching payload to the dense RAG agent.")
+             state["optimizations"]["agent_routed"] = "rag_agent"
              
              # Execute the end-to-end RAG pipeline
              final_state = await self.rag_agent.ainvoke(state)
@@ -125,6 +135,7 @@ class ExecutionGraph:
              return final_state
         
         # Failsafe Catch-all
+        state["optimizations"]["agent_routed"] = "fallback"
         state["answer"] = "I am unsure how to route this specific query format."
         state["chat_history"].append({"role": "assistant", "content": state["answer"]})
         return state

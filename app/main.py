@@ -12,8 +12,12 @@ import asyncio
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    # Optional dependency in constrained environments; service can still run with injected env vars.
+    pass
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -68,12 +72,18 @@ async def health_check():
         "hardware_profile": hw_config,
         "active_models": {
             "synthesis": "llama-3.3-70b-versatile",
-            "metadata_extraction": "qwen3-32b",
+            "metadata_extraction": "llama-3.1-8b-instant",
             "verifier": "Sarvam M",
             "reranker": "bge-reranker-large",
             "embeddings": "BAAI/bge-large-en-v1.5"
         }
     }
+
+
+@app.get("/health", tags=["Health"], include_in_schema=False)
+async def legacy_health_alias():
+    """Backward-compatible alias for health checks."""
+    return await health_check()
 
 # -----------------------------------------------------------------------------
 # Application Execution
