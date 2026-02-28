@@ -8,6 +8,7 @@ to strictly score the relevance from 0-1, explicitly isolating only the TOP 5 ch
 """
 import logging
 import threading
+import os
 from typing import List, Dict, Any
 from app.infra.hardware import HardwareProbe
 
@@ -18,11 +19,14 @@ class SemanticReranker:
     Applies BGE-Reranker matrices against candidate pairs.
     """
     
-    def __init__(self, model_name: str = "BAAI/bge-reranker-large"):
+    _instances = {}
+    _instances_lock = threading.Lock()
+
+    def __init__(self, model_name: str = None):
         """
         Instantiates the PyTorch model onto the local GPU dynamically.
         """
-        self.model_name = model_name
+        self.model_name = model_name or os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-large")
         self._model = None
         self._gpu_lock = threading.Lock()
         profile = HardwareProbe.get_profile()
@@ -34,6 +38,14 @@ class SemanticReranker:
         # In a physical deployment, this checks `app.infra.hardware.HardwareProbe`
         # and binds to 'cuda' or 'mps' immediately upon instantiation.
         logger.info(f"[RERANKER] Scaffolded {self.model_name}. Model will lazy-load on first execution.")
+
+    @classmethod
+    def get_instance(cls, model_name: str = None):
+        name = model_name or os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-large")
+        with cls._instances_lock:
+            if name not in cls._instances:
+                cls._instances[name] = cls(model_name=name)
+            return cls._instances[name]
         
     @property
     def model(self):
@@ -64,6 +76,10 @@ class SemanticReranker:
         """
         if not context_chunks:
             return []
+
+        if os.getenv("RERANKER_ENABLED", "true").lower() != "true":
+            logger.info("[RERANKER] Disabled via env. Returning top_k from dense retrieval.")
+            return context_chunks[:top_k]
             
         # We must align the payloads as a 2D Array mapping [ [Query, Chunk1], [Query, Chunk2] ]
         pairs = [[query, chunk.get("page_content", "")] for chunk in context_chunks]

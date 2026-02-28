@@ -66,18 +66,7 @@ class EmbeddingModel:
             import logging
             
             # -------------------------------------------------------------------------
-            # 1. Silence HuggingFace Authentication Warnings
-            # -------------------------------------------------------------------------
-            hf_token = os.getenv("HF_TOKEN")
-            if hf_token:
-                try:
-                    from huggingface_hub import login
-                    login(token=hf_token)
-                except Exception:
-                    pass
-                    
-            # -------------------------------------------------------------------------
-            # 2. Silence BAAI bge-large 'Unexpected Layer' Warnings
+            # 1. Silence BAAI bge-large 'Unexpected Layer' Warnings
             # -------------------------------------------------------------------------
             # The BAAI model natively contains legacy layers that trigger massive console spam 
             # if the transformers logging module isn't explicitly clamped.

@@ -6,6 +6,7 @@ It acts as the single entrypoint for the `/chat` route. It physically passes the
 dictionary down the pipe, running the Guard -> Intent -> RAG or Smalltalk sequence.
 """
 import logging
+import os
 import asyncio
 from typing import Dict, Any
 import re
@@ -19,6 +20,7 @@ from app.supervisor.planner import AdaptivePlanner
 from app.agents.rag import RAGAgent
 from app.agents.coder import CoderAgent
 from app.reasoning.complexity import ComplexityClassifier
+from app.infra.provider_router import ProviderRouter
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ class ExecutionGraph:
         self.planner = AdaptivePlanner()
         self.rag_agent = RAGAgent()
         self.coder_agent = CoderAgent()
+        self.provider_router = ProviderRouter()
 
     @staticmethod
     def _strip_think(text: str) -> str:
@@ -48,7 +51,7 @@ class ExecutionGraph:
         text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
         return text.strip()
         
-    async def invoke(self, query: str, chat_history: list = None, session_id: str = "", tenant_id: str = None, model_provider: str = "groq") -> AgentState:
+    async def invoke(self, query: str, chat_history: list = None, session_id: str = "", tenant_id: str = None, model_provider: str = "groq", extra_collections: list = None, reranker_profile: str = "auto", reranker_model_name: str = None) -> AgentState:
         """
         The formal entrypoint called by `app.api.routes`.
         
@@ -81,6 +84,7 @@ class ExecutionGraph:
             "search_query": None,
             "context_chunks": [],
             "context_text": "",
+            "extra_collections": extra_collections or [],
             "confidence": 0.0,
             "verifier_verdict": "PENDING",
             "is_hallucinated": False,
@@ -92,7 +96,11 @@ class ExecutionGraph:
             "reasoning_effort": "low",
             "latency_optimizations": {}
         }
-        state["optimizations"]["model_provider"] = model_provider
+        selected_provider = self.provider_router.select_provider(model_provider)
+        state["optimizations"]["model_provider"] = selected_provider
+        state["optimizations"]["reranker_profile"] = reranker_profile
+        if reranker_model_name:
+            state["optimizations"]["reranker_model_name"] = reranker_model_name
         
         # Persist the user turn immediately
         if session_id:
@@ -107,16 +115,41 @@ class ExecutionGraph:
         # Guard uses blocking HTTP; offload to thread so API event loop stays responsive.
         safety_report = await asyncio.to_thread(self.guard.evaluate, query)
         if safety_report.get("is_malicious", False):
-            logger.warning(f"[ROUTER] Guard intercepted payload. Flagged as: {safety_report.get('categories')}")
-            state["answer"] = "Security Exception: Your request violates Enterprise parameters."
-            state["confidence"] = 1.0
-            state["chat_history"].append({"role": "assistant", "content": state["answer"]})
-            if session_id:
-                try:
-                    save_chat_turn(session_id, "assistant", state["answer"])
-                except Exception:
-                    pass
-            return state
+            guard_strict = os.getenv("GUARD_STRICT", "false").lower() == "true"
+            if not guard_strict:
+                safe_phrases = [
+                    "summarize", "summary", "read the text", "extract text", "ocr",
+                    "describe the image", "what is in the image", "list the text"
+                ]
+                risky_phrases = [
+                    "ignore previous", "system prompt", "developer message", "jailbreak",
+                    "exfiltrate", "bypass", "override", "policy"
+                ]
+                q = (query or "").lower()
+                if any(s in q for s in safe_phrases) and not any(r in q for r in risky_phrases):
+                    logger.warning("[ROUTER] Guard flagged safe-looking prompt; soft-allow enabled.")
+                else:
+                    logger.warning(f"[ROUTER] Guard intercepted payload. Flagged as: {safety_report.get('categories')}")
+                    state["answer"] = "Security Exception: Your request violates Enterprise parameters."
+                    state["confidence"] = 1.0
+                    state["chat_history"].append({"role": "assistant", "content": state["answer"]})
+                    if session_id:
+                        try:
+                            save_chat_turn(session_id, "assistant", state["answer"])
+                        except Exception:
+                            pass
+                    return state
+            else:
+                logger.warning(f"[ROUTER] Guard intercepted payload. Flagged as: {safety_report.get('categories')}")
+                state["answer"] = "Security Exception: Your request violates Enterprise parameters."
+                state["confidence"] = 1.0
+                state["chat_history"].append({"role": "assistant", "content": state["answer"]})
+                if session_id:
+                    try:
+                        save_chat_turn(session_id, "assistant", state["answer"])
+                    except Exception:
+                        pass
+                return state
             
         # -------------------------------------------------------------
         # STEP 2: REASONING (Intent + Complexity in Parallel)
@@ -135,6 +168,9 @@ class ExecutionGraph:
         state["reasoning_effort"] = plan.get("reasoning_effort", state["reasoning_effort"])
         if plan.get("override_model"):
             state["optimizations"]["override_model"] = plan["override_model"]
+        if state.get("extra_collections") and plan.get("route") == "out_of_scope":
+            logger.info("[ROUTER] File context present; overriding out_of_scope to rag_agent.")
+            plan["route"] = "rag_agent"
 
         # -------------------------------------------------------------
         # STEP 4: PROMPT OPTIMIZATION (MoE Rewriter)

@@ -1,0 +1,15 @@
+graph TD
+    %% Styling
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#212529;
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef core fill:#e8f5e9,stroke:#388e3c,stroke-width:2px;
+    classDef storage fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+    classDef highlight fill:#e8eaf6,stroke:#3f51b5,stroke-width:3px;
+
+    subgraph Phase5 [Phase 7: API-First Decoupling]
+        direction TB
+        UI([Streamlit Frontend]):::input --> |HTTP /api/v1/chat| API[FastAPI Gateway]:::core
+        API --> Router{Multimodal / RAG Router}:::highlight
+        UI -.-> |HTTP /api/v1/ingest| IngestAPI[Ingestion Endpoints]:::core
+        IngestAPI --> Celery{Celery Task Queue}:::storage
+    end

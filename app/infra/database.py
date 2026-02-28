@@ -5,6 +5,7 @@ SQLite Persistence Layer for Crawler & Analytics.
 import sqlite3
 import os
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +61,34 @@ def init_chat_history_db():
         role TEXT,
         content TEXT,
         timestamp TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def init_ephemeral_collections_db():
+    """Ensures the ephemeral collections table exists."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS ephemeral_collections (
+        collection_name TEXT PRIMARY KEY,
+        created_at REAL
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def init_session_collections_db():
+    """Ensures the session->collection mapping table exists."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS session_collections (
+        session_id TEXT PRIMARY KEY,
+        collection_name TEXT,
+        created_at REAL,
+        updated_at REAL
     )
     """)
     conn.commit()
@@ -154,6 +183,83 @@ def get_chat_history(session_id: str, limit: int = 20):
     rows = c.fetchall()
     conn.close()
     return [{"role": r["role"], "content": r["content"], "timestamp": r["timestamp"]} for r in rows]
+
+def record_ephemeral_collection(collection_name: str, created_at: float):
+    init_ephemeral_collections_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO ephemeral_collections (collection_name, created_at) VALUES (?, ?)",
+        (collection_name, created_at),
+    )
+    conn.commit()
+    conn.close()
+
+def upsert_session_collection(session_id: str, collection_name: str, created_at: float = None, updated_at: float = None):
+    init_session_collections_db()
+    now = time.time()
+    created_at = created_at or now
+    updated_at = updated_at or now
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO session_collections (session_id, collection_name, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            collection_name=excluded.collection_name,
+            updated_at=excluded.updated_at
+        """,
+        (session_id, collection_name, created_at, updated_at),
+    )
+    conn.commit()
+    conn.close()
+
+def get_session_collection(session_id: str):
+    init_session_collections_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM session_collections WHERE session_id=?", (session_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "session_id": row["session_id"],
+        "collection_name": row["collection_name"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+def delete_session_collection_by_collection(collection_name: str):
+    init_session_collections_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM session_collections WHERE collection_name=?", (collection_name,))
+    conn.commit()
+    conn.close()
+
+def list_expired_collections(ttl_hours: int):
+    init_ephemeral_collections_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff = time.time() - (ttl_hours * 3600)
+    c.execute(
+        "SELECT collection_name FROM ephemeral_collections WHERE created_at < ?",
+        (cutoff,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def delete_ephemeral_collection_record(collection_name: str):
+    init_ephemeral_collections_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM ephemeral_collections WHERE collection_name=?", (collection_name,))
+    conn.commit()
+    conn.close()
 
 def get_all_pages(session_id):
     conn = sqlite3.connect(DB_PATH)

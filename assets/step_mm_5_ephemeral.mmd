@@ -1,0 +1,5 @@
+graph LR
+  A([Input: Extracted Text String]) --> B[Qdrant Ephemeral DB Router]
+  B --> C([Output: Session-Isolated Document Vectors])
+  style A fill:#e1f5fe,stroke:#0288d1
+  style C fill:#fce4ec,stroke:#c2185b

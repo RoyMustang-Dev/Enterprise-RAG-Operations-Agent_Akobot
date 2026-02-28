@@ -8,6 +8,7 @@ crashing the OS memory violently.
 import os
 import logging
 import multiprocessing
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,28 @@ class HardwareProbe:
                 gpu_name = "Forced"
             else:
                 try:
+                    # Ensure torch DLLs are discoverable on Windows
+                    if sys.platform == "win32":
+                        venv_root = os.path.abspath(os.path.join(os.path.dirname(sys.executable), ".."))
+                        torch_lib = os.path.join(venv_root, "Lib", "site-packages", "torch", "lib")
+                        if os.path.isdir(torch_lib):
+                            try:
+                                os.add_dll_directory(torch_lib)
+                            except Exception:
+                                pass
+                        # Also add NVIDIA runtime DLLs (used by Paddle/CUDA stacks)
+                        nvidia_root = os.path.join(venv_root, "Lib", "site-packages", "nvidia")
+                        if os.path.isdir(nvidia_root):
+                            try:
+                                for entry in os.listdir(nvidia_root):
+                                    dll_dir = os.path.join(nvidia_root, entry, "bin")
+                                    if os.path.isdir(dll_dir):
+                                        try:
+                                            os.add_dll_directory(dll_dir)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
                     import torch
                     if torch.cuda.is_available():
                         has_gpu = True
@@ -60,6 +83,8 @@ class HardwareProbe:
                         gpu_name = "Apple Silicon"
                 except ImportError:
                     logger.warning("PyTorch not installed. Falling back strictly to CPU mapping.")
+                except OSError as e:
+                    logger.error(f"PyTorch failed to load native libs: {e}. Falling back to CPU mapping.")
 
             # Heuristic batch sizes
             if device == "cuda":

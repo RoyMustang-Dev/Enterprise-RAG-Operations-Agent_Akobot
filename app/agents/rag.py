@@ -135,6 +135,20 @@ class RAGAgent:
         # 2. Primary Search (Filtered)
         # We attempt retrieval using the dynamically extracted metadata filters (e.g. author, doc_type)
         chunks = self.vector_store.search(query_tensor, k=30, metadata_filters=filters)
+
+        # Optional: merge in retrieval results from extra ephemeral collections (uploaded files)
+        extra_collections = state.get("extra_collections", []) or []
+        if extra_collections:
+            for collection_name in extra_collections:
+                try:
+                    extra_store = QdrantStore(collection_name=collection_name, dimension=self.vector_store.dimension)
+                    # Avoid applying KB metadata filters to uploaded files (they may not contain those fields).
+                    extra_results = extra_store.search(query_tensor, k=30, metadata_filters=None)
+                    for item in extra_results:
+                        item["_collection"] = collection_name
+                    chunks.extend(extra_results)
+                except Exception as e:
+                    logger.warning(f"[RAG AGENT] Failed to query extra collection {collection_name}: {e}")
         
         # 3. Smart Fallback: If no results and filters were applied, retry unfiltered
         # This prevents over-restrictive metadata from causing 0-result failures.
@@ -168,7 +182,32 @@ class RAGAgent:
         raw_chunks = state["context_chunks"]
         
         # Compress 30 -> 5
-        refined_chunks = self.reranker.rerank(query, raw_chunks, top_k=5)
+        try:
+            top_k = int(os.getenv("RERANK_TOP_K", 5))
+        except Exception:
+            top_k = 5
+
+        reranker_profile = state.get("optimizations", {}).get("reranker_profile", "auto")
+        model_override = state.get("optimizations", {}).get("reranker_model_name")
+        reranker_enabled = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
+
+        if reranker_profile == "off":
+            reranker_enabled = False
+        if not reranker_enabled:
+            refined_chunks = raw_chunks[:top_k]
+        else:
+            if reranker_profile == "fast":
+                model_name = "BAAI/bge-reranker-base"
+            elif reranker_profile == "accurate":
+                model_name = "BAAI/bge-reranker-large"
+            else:
+                model_name = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-large")
+
+            if model_override:
+                model_name = model_override
+
+            reranker = SemanticReranker.get_instance(model_name=model_name)
+            refined_chunks = reranker.rerank(query, raw_chunks, top_k=top_k)
         state["context_chunks"] = refined_chunks
         t1 = time.perf_counter()
         state.setdefault("latency_optimizations", {})

@@ -1,0 +1,5 @@
+graph LR
+  A([Input: UploadFile PNG/JPEG/WAV + JSON]) --> B[FastAPI /api/v1/chat]
+  B --> C([Output: Parsed Multimodal Request])
+  style A fill:#e1f5fe,stroke:#0288d1
+  style C fill:#fce4ec,stroke:#c2185b

@@ -47,6 +47,7 @@ class AgentState(TypedDict):
     search_query: Optional[str]         # The "Magic Prompt" rewritten query
     context_chunks: List[Dict[str, Any]] # The raw dictionaries grabbed from Qdrant Vector Store
     context_text: str                   # The formatted string block containing cited context
+    extra_collections: List[str]        # Optional extra Qdrant collections to include in retrieval
     
     # Evaluation Mechanics
     confidence: float                   # 0.00 to 1.00 numeric confidence of the answer

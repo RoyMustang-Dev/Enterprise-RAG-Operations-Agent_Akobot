@@ -9,10 +9,10 @@ graph TD
     classDef highlight fill:#e8eaf6,stroke:#3f51b5,stroke-width:3px;
     classDef data fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
 
-    subgraph Layer1 [Layer 1: Document Uploads]
+    subgraph Layer1 [Layer 1: Multimodal Ingestion]
         direction TB
-        DocInput([Input: PDF, DOCX, TXT]) --> DocLoader[PyMuPDF Loader]
-        DocLoader_Out([Output: Raw Document Text])
+        DocInput([Input: PDF, DOCX, TXT, PNG, JPEG, WAV]) --> DocLoader[PyMuPDF + EasyOCR + Whisper STT]
+        DocLoader_Out([Output: Transcribed Raw Text])
         DocLoader --> DocLoader_Out
     end
 

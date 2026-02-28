@@ -1,0 +1,15 @@
+graph TD
+    %% Styling
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#212529;
+    classDef core fill:#e8f5e9,stroke:#388e3c,stroke-width:2px;
+    classDef storage fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+    classDef highlight fill:#e8eaf6,stroke:#3f51b5,stroke-width:3px;
+    classDef verify fill:#ffebee,stroke:#c62828,stroke-width:2px;
+
+    subgraph Phase8_9 [Phase 8 & 9: Telemetry, Verification & Qdrant Cloud]
+        direction TB
+        Qdrant[(Remote Managed Qdrant Cloud)]:::storage --> RAGDAG[Core RAG LangGraph]:::core
+        RAGDAG --> Verifier{Sarvam M<br/>Fact Verifier}:::verify
+        Verifier --> Formatter[Response Formatter + Citation Builder]:::core
+        Formatter -.-> TelemetryLog[(Local JSONL Audit Logger)]:::storage
+    end

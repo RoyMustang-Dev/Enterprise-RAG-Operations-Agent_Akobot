@@ -1,0 +1,20 @@
+graph TD
+    %% Styling
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#212529;
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef core fill:#e8f5e9,stroke:#388e3c,stroke-width:2px;
+    classDef highlight fill:#e8eaf6,stroke:#3f51b5,stroke-width:3px;
+    classDef storage fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+    
+    subgraph Phase5_6 [Phase 5 & 6: Provider-Agnostic Agentic Routing]
+        direction TB
+        State[Global AgentState Object<br/>app/core/types.py]:::input
+        State --> Handler{Dynamic Model Provider<br/>get_provider}:::core
+        
+        Handler --> |Groq API| Groq[Llama / Llama Instant]:::highlight
+        Handler --> |Anthropic API| Anthropic[Claude Sonnet / Haiku]:::highlight
+        Handler --> |OpenAI API| OpenAI[GPT-4o / GPT-4o-mini]:::highlight
+        Handler --> |Gemini API| Gemini[Gemini Pro / Flash]:::highlight
+        
+        Groq & Anthropic & OpenAI & Gemini --> GraphNodes(LangGraph Execution Logic):::storage
+    end

@@ -1,0 +1,32 @@
+graph TD
+    %% Styling
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#212529;
+    classDef input fill:#e1f5fe,stroke:#0288d1,stroke-width:2px;
+    classDef core fill:#e8f5e9,stroke:#388e3c,stroke-width:2px;
+    classDef output fill:#fce4ec,stroke:#c2185b,stroke-width:2px;
+    classDef highlight fill:#fff3e0,stroke:#f57c00,stroke-width:3px;
+    
+    subgraph MultiModal [Phase 11: Multimodality Pipeline]
+        direction TB
+        
+        InputImage([Image Payload]):::input --> Router{Image Mode}:::core
+        InputFile([File Payload PDF/DOCX/TXT/MD]):::input --> PyMuPDF[PyMuPDF Fitz<br/>Loader & Splitter]:::highlight
+        
+        Router --> |OCR| EasyOCR[EasyOCR Parse<br/>PyTorch Native]:::highlight
+        Router --> |Vision| VisionBackend{Vision Backend}:::core
+        
+        VisionBackend --> |blip| BLIP[BLIP Base<br/>Low VRAM Fallback]:::highlight
+        VisionBackend --> |llava| LLaVA[LLaVA 1.5 7B<br/>High Reasoning]:::highlight
+        
+        EasyOCR --> Grounding([Extracted Text to Vector Grounding]):::output
+        PyMuPDF --> Grounding
+        
+        BLIP --> QASynthesis([Visual Q&A Synthesis]):::output
+        LLaVA --> QASynthesis
+        
+        InputAudio([Audio Payload]):::input --> Whisper[Groq Whisper API<br/>Transcribe Proxy]:::highlight
+        Whisper --> TextTranscript([Extracted Text Query]):::output
+        
+        InputSynthesis([RAG Text Output]):::input --> CoquiTTS[Coqui TTS Engine<br/>Local Generation]:::highlight
+        CoquiTTS --> AudioOutput([WAV Audio Output]):::output
+    end

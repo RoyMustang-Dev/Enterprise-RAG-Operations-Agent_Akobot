@@ -31,6 +31,8 @@ class QdrantStore:
 
     _instances = {}
     _instances_lock = threading.Lock()
+    _shared_local_client = None
+    _shared_local_path = None
 
     def __new__(cls, dimension: int = 1024, collection_name: str = None, path: str = "data/qdrant_storage", *args, **kwargs):
         actual_collection = collection_name or os.getenv("QDRANT_COLLECTION") or "enterprise_rag"
@@ -56,13 +58,21 @@ class QdrantStore:
         self.qdrant_url = os.getenv("QDRANT_URL")
         self.qdrant_api_key = os.getenv("QDRANT_API_KEY")
         self.is_cloud = bool(self.qdrant_url and self.qdrant_api_key)
+        if self.qdrant_url and not self.qdrant_api_key:
+            logger.warning("[QDRANT] QDRANT_URL set but QDRANT_API_KEY missing. Falling back to local storage.")
+        if self.qdrant_api_key and not self.qdrant_url:
+            logger.warning("[QDRANT] QDRANT_API_KEY set but QDRANT_URL missing. Falling back to local storage.")
 
         if self.is_cloud:
             self.client = QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
             logger.info("[QDRANT] Connected to Qdrant Cloud deployment.")
         else:
             os.makedirs(self.path, exist_ok=True)
-            self.client = QdrantClient(path=self.path)
+            # Reuse a shared local client to avoid file-lock conflicts across collections.
+            if QdrantStore._shared_local_client is None or QdrantStore._shared_local_path != self.path:
+                QdrantStore._shared_local_client = QdrantClient(path=self.path)
+                QdrantStore._shared_local_path = self.path
+            self.client = QdrantStore._shared_local_client
             logger.info("[QDRANT] Using local persistent storage.")
 
         self._ensure_collection()
@@ -112,6 +122,15 @@ class QdrantStore:
             self.client = QdrantClient(path=self.path)
             self._ensure_collection()
             logger.info("[QDRANT] Local database cleared.")
+
+    def delete_collection(self, collection_name: str = None):
+        """Deletes a specific collection and clears the cached instance."""
+        target = collection_name or self.collection_name
+        with self._lock:
+            self.client.delete_collection(collection_name=target)
+        # Remove cached instance so future requests re-init cleanly
+        if target in QdrantStore._instances:
+            QdrantStore._instances.pop(target, None)
 
     def get_all_documents(self) -> List[str]:
         """Returns unique source names currently stored in vector payloads."""

@@ -9,10 +9,25 @@ import sys
 import asyncio
 import logging
 import time
+import threading
+import multiprocessing as mp
+
+# CRITICAL SECURITY/STABILITY PATCH:
+# Force Windows to load the pristine cu121 Native DLLs into the Python 
+# executable's global namespace BEFORE third-party libraries (like PaddleOCR)
+# can blindly inject older cu11 DLL dependencies and trigger WinError 127.
+try:
+    import torch
+except Exception:
+    pass
 
 # CRITICAL for Windows: Playwright subprocesses require the Proactor event loop
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        mp.set_executable(sys.executable)
+    except Exception:
+        pass
 
 try:
     from dotenv import load_dotenv
@@ -25,10 +40,15 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+# Patch qdrant-client grpc annotations before any qdrant imports
+from app.infra.qdrant_patch import ensure_qdrant_grpc_compat
+ensure_qdrant_grpc_compat()
+
 # Import the new Vertical Slice router
 from app.api.routes import router as api_router
 from app.infra.otel import init_otel
 from app.infra.hardware import HardwareProbe
+from app.infra.model_bootstrap import configure_model_cache, preload_models
 
 # -----------------------------------------------------------------------------
 # FastAPI Application Initialization
@@ -38,6 +58,12 @@ app = FastAPI(
     description="Vertical Slice implementation of the ReAct + MoE Architecture.",
     version="2.0.0",
 )
+
+# Configure model cache dir before any heavy model loads
+configure_model_cache()
+
+# Optional paddle runtime auto-install (controlled by env)
+
 
 # Log hardware profile on startup
 HardwareProbe.get_profile()
@@ -73,6 +99,31 @@ app.include_router(api_router, prefix="/api/v1")
 
 # Optional OpenTelemetry bootstrap
 init_otel(app)
+
+# -----------------------------------------------------------------------------
+# Ephemeral Collection Cleanup (Background Timer)
+# -----------------------------------------------------------------------------
+def _start_ephemeral_cleanup_daemon():
+    interval_min = int(os.getenv("EPHEMERAL_CLEANUP_INTERVAL_MINUTES", "60"))
+    from app.multimodal.session_vector import SessionVectorManager
+    manager = SessionVectorManager()
+
+    def _loop():
+        logger.info(f"[CLEANUP] Ephemeral collection cleanup started. Interval={interval_min}m")
+        while True:
+            try:
+                manager.cleanup_expired()
+            except Exception as e:
+                logger.warning(f"[CLEANUP] Ephemeral cleanup failed: {e}")
+            time.sleep(interval_min * 60)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+_start_ephemeral_cleanup_daemon()
+
+# Optional model preload (controlled by PRELOAD_MODELS=true)
+preload_models()
 
 # Request logging middleware
 @app.middleware("http")

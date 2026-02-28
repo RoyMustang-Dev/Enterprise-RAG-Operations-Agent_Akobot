@@ -10,7 +10,10 @@ python-docx
 beautifulsoup4
 sentence-transformers
 faiss-cpu
-requests
+requests==2.32.5
+urllib3==2.2.3
+charset-normalizer==3.3.2
+chardet==5.2.0
 pytest
 langgraph
 langchain-core
@@ -23,3 +26,11 @@ tiktoken
 tenacity
 python-dotenv
 playwright
+pillow
+numpy
+transformers
+coqui-tts
+easyocr
+celery
+redis
+accelerate
