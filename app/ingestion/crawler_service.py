@@ -18,17 +18,19 @@ import asyncio
 import os
 import json
 import urllib.robotparser
-from urllib.parse import urlparse, urljoin, urldefrag, urlencode, parse_qs
-import requests
 import uuid
 import math
 import random
-from typing import Optional
-from urllib.parse import urlparse, urljoin, urldefrag
+import hashlib
+import time
+from typing import Optional, Dict
+from collections import defaultdict
+from urllib.parse import urlparse, urljoin, urldefrag, urlencode, parse_qs, urlunparse
 from datetime import datetime
+
+import aiohttp
 from playwright.async_api import async_playwright, Page, BrowserContext
 from selectolax.parser import HTMLParser
-from difflib import SequenceMatcher
 from app.infra.database import init_db, insert_page_async, get_all_pages, enable_wal
 from app.infra.hardware import HardwareProbe
 import logging
@@ -45,6 +47,11 @@ class CrawlerService:
         self._proxy_pool = [
             p.strip() for p in os.getenv("CRAWLER_PROXY_URLS", "").split(",") if p.strip()
         ]
+        self._robots_cache: Dict[str, urllib.robotparser.RobotFileParser] = {}
+        self._domain_semaphores = defaultdict(lambda: asyncio.Semaphore(int(os.getenv("CRAWLER_DOMAIN_CONCURRENCY", "6"))))
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._pattern_seen = set()
+        self._content_hashes = set()
 
     # ---------------- SMART URL SCORING (NO KEYWORDS) ---------------- #
 
@@ -52,8 +59,21 @@ class CrawlerService:
         probs = [url.count(c)/len(url) for c in set(url)]
         return -sum(p * math.log2(p) for p in probs)
 
-    def _similarity(self, a: str, b: str) -> float:
-        return SequenceMatcher(None, a, b).ratio()
+    def _pattern_signature(self, url: str) -> str:
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        # Replace digits/hex/uuid-ish segments with placeholders
+        parts = []
+        for seg in path.split("/"):
+            if not seg:
+                continue
+            if seg.isdigit():
+                parts.append("{num}")
+            elif len(seg) >= 8 and all(c in "0123456789abcdef" for c in seg.lower()):
+                parts.append("{hex}")
+            else:
+                parts.append(seg)
+        return "/".join(parts)
 
     def _get_best_links(self, links: list, visited: set, limit: int = 5) -> list:
         """
@@ -75,27 +95,38 @@ class CrawlerService:
             plen = len(path)
 
             dup_penalty = 0
-            for v in visited:
-                if self._similarity(link, v) > 0.85:
-                    dup_penalty -= 5
+            signature = self._pattern_signature(link)
+            if signature in self._pattern_seen:
+                dup_penalty -= 5
 
             score = entropy + (2 <= depth <= 4) * 2 + (20 < plen < 120) * 2 + dup_penalty
             scored.append((score, link))
 
         scored.sort(reverse=True)
-        return [x[1] for x in scored[:limit]]
+        best = [x[1] for x in scored[:limit]]
+        for link in best:
+            self._pattern_seen.add(self._pattern_signature(link))
+        return best
 
     # ---------------- ROBOTS ---------------- #
 
-    def _get_robots_parser(self, url):
+    async def _get_robots_parser(self, url: str):
         parsed = urlparse(url)
-        robots = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        if base in self._robots_cache:
+            return self._robots_cache[base]
+        robots = f"{base}/robots.txt"
         rp = urllib.robotparser.RobotFileParser()
         try:
-            r = requests.get(robots, timeout=5)
-            rp.parse(r.text.splitlines())
-        except:
-            rp.allow_all = True
+            async with self._http_session.get(robots, timeout=5) as resp:
+                if resp.status >= 400:
+                    rp.parse([])
+                else:
+                    text = await resp.text(errors="ignore")
+                    rp.parse(text.splitlines())
+        except Exception:
+            rp.parse([])
+        self._robots_cache[base] = rp
         return rp
 
     def is_allowed(self, url, rp):
@@ -149,17 +180,18 @@ class CrawlerService:
 
     def _clean_content(self, html: str) -> str:
         """Removes headers, footers, navs to extract main content."""
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # Remove distractions
-        for tag in soup(["header", "footer", "nav", "aside", "script", "style", "noscript", "iframe"]):
+        tree = HTMLParser(html)
+        for tag in tree.css("header,footer,nav,aside,script,style,noscript,iframe"):
             tag.decompose()
-        try:
-            from markdownify import markdownify as md
-            content = md(str(soup))
-        except Exception:
-            content = soup.get_text(separator="\n", strip=True)
-        # Normalize excessive whitespace
+        use_markdown = os.getenv("CRAWLER_MARKDOWNIFY", "false").lower() == "true"
+        if use_markdown:
+            try:
+                from markdownify import markdownify as md
+                content = md(tree.html)
+            except Exception:
+                content = tree.body.text(separator="\n") if tree.body else tree.text(separator="\n")
+        else:
+            content = tree.body.text(separator="\n") if tree.body else tree.text(separator="\n")
         content = "\n".join([line.strip() for line in content.splitlines() if line.strip()])
         return content
 
@@ -167,7 +199,8 @@ class CrawlerService:
         if not html:
             return True
         # Heuristic for SPA shells
-        low_text = len(BeautifulSoup(html, "html.parser").get_text(strip=True)) < int(os.getenv("CRAWLER_HTTP_MIN_CHARS", "500"))
+        tree = HTMLParser(html)
+        low_text = len(tree.text(strip=True)) < int(os.getenv("CRAWLER_HTTP_MIN_CHARS", "200"))
         spa_markers = ["id=\"root\"", "id=\"app\"", "data-reactroot", "data-v-app"]
         if any(marker in html for marker in spa_markers) and low_text:
             return True
@@ -175,11 +208,6 @@ class CrawlerService:
 
     async def _fetch_static(self, url: str, proxy: str = None) -> Optional[dict]:
         """Fast-path: attempt SSR HTML fetch via aiohttp before Playwright."""
-        try:
-            import aiohttp
-        except Exception:
-            return None
-
         headers = {
             "User-Agent": os.getenv(
                 "CRAWLER_HTTP_USER_AGENT",
@@ -188,16 +216,15 @@ class CrawlerService:
         }
         timeout = aiohttp.ClientTimeout(total=12)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=headers, proxy=proxy) as resp:
-                    if resp.status >= 400:
-                        return None
-                    html = await resp.text(errors="ignore")
-                    if self._should_fallback_to_browser(html):
-                        return None
-                    soup = BeautifulSoup(html, "html.parser")
-                    title = soup.title.string.strip() if soup.title and soup.title.string else url
-                    return {"url": url, "title": title, "html": html}
+            async with self._http_session.get(url, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                if resp.status >= 400:
+                    return None
+                html = await resp.text(errors="ignore")
+                if self._should_fallback_to_browser(html):
+                    return None
+                tree = HTMLParser(html)
+                title = tree.css_first("title").text().strip() if tree.css_first("title") else url
+                return {"url": url, "title": title, "html": html}
         except Exception:
             return None
 
@@ -231,13 +258,18 @@ class CrawlerService:
     # ---------------- WORKER ---------------- #
 
     async def _worker(self, wid, queue, context, session_id, rp,
-                      visited, visited_lock, db_queue, simulate, stop_event):
+                      visited, visited_lock, db_queue, simulate, stop_event, max_urls: int, start_ts: float, max_seconds: float, http_only: bool):
 
         # Block resources for speed if not in simulation mode
         if not simulate:
             try:
-                await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,css,woff,woff2,ttf,mp4,webm,ad,ads}", lambda route: route.abort())
-            except:
+                async def _route_handler(route):
+                    if route.request.resource_type in {"image", "font", "media"}:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                await context.route("**/*", _route_handler)
+            except Exception:
                 pass
 
         page = await context.new_page()
@@ -254,6 +286,10 @@ class CrawlerService:
                 break
 
             url, depth, max_depth = item
+            if max_seconds and (time.perf_counter() - start_ts) > max_seconds:
+                stop_event.set()
+            if max_urls and len(visited) >= max_urls:
+                stop_event.set()
 
             # Check if stopped mid-work
             if stop_event.is_set():
@@ -261,13 +297,9 @@ class CrawlerService:
                 break
 
             async with visited_lock:
-                from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
                 def normalize_url(u):
                     parsed = urlparse(u)
-                    # Strip trailing slashes and normalize case
-                    path = parsed.path.rstrip("/")
-                    if not path: path = "/"
-                    # Remove session-id/tracking bloat from queries to prevent infinite spider traps
+                    path = parsed.path.rstrip("/") or "/"
                     qs = parse_qs(parsed.query)
                     for bad in ["session", "ref", "uid", "token", "source", "click"]:
                         qs.pop(bad, None)
@@ -289,12 +321,18 @@ class CrawlerService:
                     proxy = random.choice(self._proxy_pool)
 
                 if use_fast_http:
-                    fast = await self._fetch_static(url, proxy=proxy)
+                    async with self._domain_semaphores[urlparse(url).netloc]:
+                        fast = await self._fetch_static(url, proxy=proxy)
                     if fast:
                         content_html = fast["html"]
                         title = fast["title"]
                         current_url = fast["url"]
                         clean_content = self._clean_content(content_html)
+                        content_hash = hashlib.sha256(clean_content.encode("utf-8", errors="ignore")).hexdigest()
+                        if content_hash in self._content_hashes:
+                            queue.task_done()
+                            continue
+                        self._content_hashes.add(content_hash)
                         await db_queue.put((session_id, current_url, title, clean_content, depth, "success"))
                         if depth < max_depth and not stop_event.is_set():
                             tree = HTMLParser(content_html)
@@ -319,25 +357,32 @@ class CrawlerService:
                                 await queue.put((t, depth + 1, max_depth))
                         queue.task_done()
                         continue
+                    if http_only:
+                        queue.task_done()
+                        continue
 
-                nav_task = asyncio.create_task(page.goto(url, wait_until="domcontentloaded", timeout=20000))
-                stop_wait_task = asyncio.create_task(stop_event.wait())
-
-                done, pending = await asyncio.wait([nav_task, stop_wait_task], return_when=asyncio.FIRST_COMPLETED)
-
-                if stop_event.is_set():
-                    # Stop was pressed! Cancel navigation immediately.
-                    nav_task.cancel()
+                nav_task = None
+                for attempt in range(3):
                     try:
+                        async with self._domain_semaphores[urlparse(url).netloc]:
+                            nav_task = asyncio.create_task(page.goto(url, wait_until="domcontentloaded", timeout=20000))
+                        stop_wait_task = asyncio.create_task(stop_event.wait())
+                        done, pending = await asyncio.wait([nav_task, stop_wait_task], return_when=asyncio.FIRST_COMPLETED)
+                        if stop_event.is_set():
+                            nav_task.cancel()
+                            try:
+                                await nav_task
+                            except asyncio.CancelledError:
+                                pass
+                            queue.task_done()
+                            break
+                        stop_wait_task.cancel()
                         await nav_task
-                    except asyncio.CancelledError:
-                        pass
-                    queue.task_done()
-                    break
-
-                # If we are here, navigation finished first
-                stop_wait_task.cancel()
-                await nav_task # Propagate exceptions if any
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(2 ** attempt)
 
                 # Canonical URL (Handle Redirects e.g., Booking.com)
                 current_url = page.url
@@ -356,6 +401,11 @@ class CrawlerService:
 
                 # If content looks empty, wait for network idle or selectors.
                 clean_content = self._clean_content(content_html)
+                content_hash = hashlib.sha256(clean_content.encode("utf-8", errors="ignore")).hexdigest()
+                if content_hash in self._content_hashes:
+                    queue.task_done()
+                    continue
+                self._content_hashes.add(content_hash)
                 min_chars = int(os.getenv("CRAWLER_HTTP_MIN_CHARS", "500"))
                 if len(clean_content) < min_chars:
                     selectors = [s.strip() for s in os.getenv("CRAWLER_WAIT_SELECTORS", "").split(",") if s.strip()]
@@ -441,17 +491,24 @@ class CrawlerService:
 
         queue = asyncio.Queue()
         db_queue = asyncio.Queue()
+        self._pattern_seen = set()
+        self._content_hashes = set()
 
         if stop_event is None:
             stop_event = asyncio.Event()
 
-        rp = self._get_robots_parser(url)
+        self._http_session = aiohttp.ClientSession()
+        rp = await self._get_robots_parser(url)
         # Note: We check robots on the normalized URL
         if not self.is_allowed(url, rp):
              self.blocked_links.append(url)
              return {"status": "blocked", "error": "Disallowed by robots.txt", "links": {"allowed": [], "blocked": [url]}}
 
         queue.put_nowait((url, 0, max_depth if recursive else 0))
+        max_urls = int(os.getenv("CRAWLER_MAX_URLS", "5000"))
+        max_seconds = float(os.getenv("CRAWLER_MAX_SECONDS", "0"))
+        start_ts = time.perf_counter()
+        http_only = os.getenv("CRAWLER_FAST_HTTP_ONLY", "false").lower() == "true"
 
         async with async_playwright() as p:
 
@@ -484,21 +541,12 @@ class CrawlerService:
             workers = [
                 asyncio.create_task(
                     self._worker(i, queue, contexts[i], session_id,
-                                 rp, visited, visited_lock, db_queue, simulate, stop_event)
+                                 rp, visited, visited_lock, db_queue, simulate, stop_event, max_urls, start_ts, max_seconds, http_only)
                 )
                 for i in range(NUM)
             ]
 
-            # Custom join to support stop_event
-            # We wait for queue to be empty OR stop_event to be set
-            while not queue.empty() or (not stop_event.is_set() and len(visited) == 0): # Condition to wait needs to be robust
-                 if stop_event.is_set():
-                     break
-                 if queue.empty() and queue._unfinished_tasks == 0:
-                     break
-                 await asyncio.sleep(0.5)
-            
-            # If we are here, either queue is empty (done) or stopped
+            # Wait for completion or stop
             if not stop_event.is_set():
                 await queue.join()
 
@@ -511,6 +559,9 @@ class CrawlerService:
             await db_queue.join()
             await db_queue.put(None)
             await db_task
+            if self._http_session:
+                await self._http_session.close()
+                self._http_session = None
 
             rows = get_all_pages(session_id)
 
