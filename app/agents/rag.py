@@ -7,6 +7,7 @@ It physically hooks together Phase 4 (Retrieval) and Phase 5 (Reasoning) into a 
 import logging
 import os
 import time
+import hashlib
 from typing import Dict, Any
 
 from langgraph.graph import StateGraph, END
@@ -27,6 +28,8 @@ from app.reasoning.formatter import ResponseFormatter
 # Phase 13 Imports
 from app.rlhf.reward_model import OnlineRewardModel
 import asyncio
+from app.infra.database import get_session_cache, upsert_session_cache, delete_session_cache
+from app.infra.token_budget import trim_chunks_by_token_budget
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +44,7 @@ class RAGAgent:
         Instantiates all immutable heavy models required for the pipeline.
         These are loaded once to prevent RAM/VRAM exhaustion on every request.
         """
-        logger.info("[RAG AGENT] Initializing Core Architecture Models...")
+        logger.info("[STAGE:RAG:INIT] Initializing Core Architecture Models...")
         self.metadata_extractor = MetadataExtractor()
         self.embedding_model = EmbeddingModel()
         self.vector_store = QdrantStore()
@@ -89,7 +92,7 @@ class RAGAgent:
         """
         Executes the compiled LangGraph pipeline.
         """
-        logger.info(f"[RAG AGENT] Commencing Execution DAG for query: {state['query'][:50]}...")
+        logger.info(f"[STAGE:RAG:DAG] Start query={state['query'][:50]}")
         # Deep copy to ensure immutable updates structurally
         try:
             result = self.graph.invoke(state)
@@ -103,7 +106,7 @@ class RAGAgent:
         """
         Executes the compiled LangGraph pipeline non-blockingly inside the asynchronous threadpool bounds.
         """
-        logger.info(f"[RAG AGENT] Commencing Execution DAG (Async) for query: {state['query'][:50]}...")
+        logger.info(f"[STAGE:RAG:DAG] Async start query={state['query'][:50]}")
         result = await self.graph.ainvoke(state)
         return result
 
@@ -115,6 +118,7 @@ class RAGAgent:
         """Dynamically extracts strict Qdrant bounds from natural language."""
         query = state["query"]
         extraction = await self.metadata_extractor.extract_filters(query)
+        logger.info("[STAGE:RAG:METADATA] extracted")
         
         # We store the applied filters in optimizations for audit tracking
         if "optimizations" not in state:
@@ -131,6 +135,7 @@ class RAGAgent:
         query = state["search_query"] or state["query"]
         filters = state.get("optimizations", {}).get("metadata_filters", {})
         tenant_id = state.get("tenant_id")
+        session_id = state.get("session_id") or ""
         use_multi_tenant = os.getenv("QDRANT_MULTI_TENANT", "false").lower() == "true"
         # If multi-tenant is disabled, we route to a per-tenant collection when provided.
         store = self.vector_store
@@ -140,38 +145,125 @@ class RAGAgent:
         elif tenant_id:
             store = QdrantStore(collection_name=tenant_id, dimension=self.vector_store.dimension)
         
-        # 1. Generate Query Embedding
-        query_tensor = self.embedding_model.generate_embedding(query)
+        # 0. Session cache (1-week TTL)
+        cache_hit = False
+        cache_notice = "Session cache is retained for 7 days and auto-deleted. Cache updates when new queries add new chunks."
+        cache_ttl_seconds = 7 * 24 * 3600
+        cached_chunks = None
+        cache_created_at = None
+        if session_id:
+            cached = get_session_cache(session_id)
+            if cached:
+                cache_created_at = cached.get("created_at")
+                if cache_created_at and (time.time() - cache_created_at) > cache_ttl_seconds:
+                    delete_session_cache(session_id)
+                else:
+                    last_hash = cached.get("last_query_hash")
+                    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+                    if last_hash == query_hash:
+                        cached_chunks = cached.get("cache", {}).get("chunks", [])
+                        cache_hit = True
+                        logger.info(f"[STAGE:RAG:CACHE] hit=true chunks={len(cached_chunks)}")
+
+        # 1. Generate Query Embedding (unless cache hit)
+        query_tensor = None
+        if not cache_hit:
+            query_tensor = self.embedding_model.generate_embedding(query)
         
         # 2. Primary Search (Filtered)
-        # We attempt retrieval using the dynamically extracted metadata filters (e.g. author, doc_type)
-        force_session = bool(state.get("force_session_context")) and bool(state.get("extra_collections"))
-        if not force_session:
-            chunks = store.search(query_tensor, k=30, metadata_filters=filters, tenant_id=tenant_filter)
+        retrieval_scope = (state.get("retrieval_scope") or "both").lower()
+        # If session-only was requested but no session collections exist, fall back to KB.
+        if retrieval_scope == "session_only" and not state.get("extra_collections"):
+            retrieval_scope = "kb_only"
+
+        chunks = []
+        complexity_score = state.get("optimizations", {}).get("complexity_score", 0.0)
+        if complexity_score >= 0.7:
+            retrieve_k = 40
+        elif complexity_score >= 0.4:
+            retrieve_k = 30
         else:
-            chunks = []
+            retrieve_k = 20
+        if cache_hit and cached_chunks is not None:
+            chunks = cached_chunks
+        else:
+            if retrieval_scope in ["both", "kb_only"]:
+                chunks = store.search(query_tensor, k=retrieve_k, metadata_filters=filters, tenant_id=tenant_filter)
+                logger.info(f"[STAGE:RAG:RETRIEVE] kb_results={len(chunks)} scope={retrieval_scope}")
 
         # Optional: merge in retrieval results from extra ephemeral collections (uploaded files)
         extra_collections = state.get("extra_collections", []) or []
-        if extra_collections:
+        if not cache_hit and extra_collections and retrieval_scope in ["both", "session_only"]:
             for collection_name in extra_collections:
                 try:
                     extra_store = QdrantStore(collection_name=collection_name, dimension=self.vector_store.dimension)
                     # Avoid applying KB metadata filters or tenant filters to uploaded session collections.
-                    extra_results = extra_store.search(query_tensor, k=30, metadata_filters=None, tenant_id=None)
+                    extra_results = extra_store.search(query_tensor, k=retrieve_k, metadata_filters=None, tenant_id=None)
                     for item in extra_results:
                         item["_collection"] = collection_name
                     chunks.extend(extra_results)
                 except Exception as e:
                     logger.warning(f"[RAG AGENT] Failed to query extra collection {collection_name}: {e}")
+            logger.info(f"[STAGE:RAG:RETRIEVE] session_merge results={len(chunks)} collections={len(extra_collections)}")
         
         # 3. Smart Fallback: If no results and filters were applied, retry unfiltered
         # This prevents over-restrictive metadata from causing 0-result failures.
-        if not chunks and filters and not force_session:
+        if not cache_hit and not chunks and filters and retrieval_scope in ["both", "kb_only"]:
             logger.info(f"[RAG AGENT] Filtered search returned 0 chunks (Filters: {filters}). Executing smart fallback to unfiltered semantic search.")
-            chunks = store.search(query_tensor, k=30, metadata_filters=None, tenant_id=tenant_filter)
+            chunks = store.search(query_tensor, k=retrieve_k, metadata_filters=None, tenant_id=tenant_filter)
             state["optimizations"]["fallback_triggered"] = True
             state["optimizations"]["original_filters"] = filters
+            logger.info(f"[STAGE:RAG:RETRIEVE] fallback_results={len(chunks)}")
+
+        # Update session cache (multi-use)
+        if session_id:
+            try:
+                query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+                if cache_hit:
+                    # Keep cache intact; refresh timestamps
+                    cached = get_session_cache(session_id)
+                    if cached:
+                        upsert_session_cache(
+                            session_id,
+                            cached.get("cache", {}),
+                            last_query_hash=query_hash,
+                            created_at=cached.get("created_at"),
+                            updated_at=time.time(),
+                        )
+                else:
+                    # Merge new chunks into cache
+                    cached = get_session_cache(session_id)
+                    existing_chunks = []
+                    created_at = None
+                    if cached:
+                        existing_chunks = cached.get("cache", {}).get("chunks", [])
+                        created_at = cached.get("created_at")
+                    dedup = {}
+                    for item in existing_chunks + chunks:
+                        key = f"{item.get('source','')}-{item.get('text','')[:120]}"
+                        dedup[key] = item
+                    merged_chunks = list(dedup.values())
+                    upsert_session_cache(
+                        session_id,
+                        {"chunks": merged_chunks},
+                        last_query_hash=query_hash,
+                        created_at=created_at,
+                        updated_at=time.time(),
+                    )
+            except Exception as e:
+                logger.warning(f"[RAG AGENT] Session cache update failed: {e}")
+
+        # Attach cache notice for client visibility
+        state.setdefault("optimizations", {})
+        state["optimizations"]["cache_notice"] = cache_notice
+        if session_id:
+            expires_at = None
+            cached = get_session_cache(session_id)
+            if cached and cached.get("created_at"):
+                expires_at = cached.get("created_at") + cache_ttl_seconds
+            state["optimizations"]["cache_expires_at"] = expires_at
+            state["optimizations"]["cache_hit"] = cache_hit
+            state["optimizations"]["cache_size"] = len(chunks)
         
         # Optional hybrid lexical rerank on dense results
         use_hybrid = os.getenv("HYBRID_SEARCH", "false").lower() == "true"
@@ -186,6 +278,7 @@ class RAGAgent:
             state["confidence"] = 1.0
             state["verifier_verdict"] = "NOT_RUN"
             state["sources"] = []
+            logger.info("[STAGE:RAG:RETRIEVE] no_chunks=true")
             
         t1 = time.perf_counter()
         state.setdefault("latency_optimizations", {})
@@ -200,9 +293,16 @@ class RAGAgent:
         
         # Compress 30 -> 5
         try:
-            top_k = int(os.getenv("RERANK_TOP_K", 5))
+            base_top_k = int(os.getenv("RERANK_TOP_K", 5))
         except Exception:
-            top_k = 5
+            base_top_k = 5
+        complexity_score = state.get("optimizations", {}).get("complexity_score", 0.0)
+        if complexity_score >= 0.7:
+            top_k = max(base_top_k, 8)
+        elif complexity_score >= 0.4:
+            top_k = max(base_top_k, 6)
+        else:
+            top_k = base_top_k
 
         model_override = state.get("optimizations", {}).get("reranker_model_name")
         reranker_enabled = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
@@ -213,6 +313,7 @@ class RAGAgent:
             model_name = model_override or os.getenv("RERANKER_MODEL_NAME", "llama-3.1-8b-instant")
             reranker = SemanticReranker.get_instance(model_name=model_name)
             refined_chunks = reranker.rerank(query, raw_chunks, top_k=top_k)
+        logger.info(f"[STAGE:RAG:RERANK] top_k={len(refined_chunks)}")
         state["context_chunks"] = refined_chunks
         t1 = time.perf_counter()
         state.setdefault("latency_optimizations", {})
@@ -255,6 +356,19 @@ class RAGAgent:
                 target_temp = 0.0
             
         logger.info(f"[RAG AGENT] Complexity Analyzer computed -> Effort: {reasoning_effort.upper()} | Selected Engine: {target_model}")
+        
+        trimmed_chunks, used_tokens, token_limit = trim_chunks_by_token_budget(
+            chunks,
+            target_model,
+            reserve_tokens=1024,
+        )
+        if len(trimmed_chunks) < len(chunks):
+            logger.info(f"[STAGE:RAG:CONTEXT] trimmed={len(chunks)}-> {len(trimmed_chunks)} used_tokens={used_tokens} limit={token_limit}")
+        chunks = trimmed_chunks
+        state["context_chunks"] = chunks
+        state.setdefault("optimizations", {})
+        state["optimizations"]["context_token_budget"] = token_limit
+        state["optimizations"]["context_tokens_used"] = used_tokens
         
         state["reasoning_effort"] = reasoning_effort
         state.setdefault("latency_optimizations", {})

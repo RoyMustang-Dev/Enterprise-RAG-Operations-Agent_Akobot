@@ -48,7 +48,10 @@ class CrawlerService:
             p.strip() for p in os.getenv("CRAWLER_PROXY_URLS", "").split(",") if p.strip()
         ]
         self._robots_cache: Dict[str, urllib.robotparser.RobotFileParser] = {}
-        self._domain_semaphores = defaultdict(lambda: asyncio.Semaphore(int(os.getenv("CRAWLER_DOMAIN_CONCURRENCY", "6"))))
+        # Dynamic concurrency based on hardware profile (no .env knobs)
+        profile = HardwareProbe.get_profile()
+        workers = int(profile.get("crawler_workers", 6))
+        self._domain_semaphores = defaultdict(lambda: asyncio.Semaphore(max(2, min(8, workers))))
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._pattern_seen = set()
         self._content_hashes = set()
@@ -169,8 +172,17 @@ class CrawlerService:
             pass
 
     async def _auto_scroll(self, page: Page):
-        steps = int(os.getenv("CRAWLER_SCROLL_STEPS", "6"))
-        pause_ms = int(os.getenv("CRAWLER_SCROLL_PAUSE_MS", "350"))
+        # Auto-scroll only when content is likely longer than the viewport
+        try:
+            dims = await page.evaluate(
+                "({h: document.body.scrollHeight, v: window.innerHeight})"
+            )
+            total = int(dims.get("h", 0))
+            view = int(dims.get("v", 0)) or 1
+            steps = max(1, min(6, int(total / view)))
+        except Exception:
+            steps = 2
+        pause_ms = 250
         for _ in range(steps):
             try:
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
@@ -183,7 +195,8 @@ class CrawlerService:
         tree = HTMLParser(html)
         for tag in tree.css("header,footer,nav,aside,script,style,noscript,iframe"):
             tag.decompose()
-        use_markdown = os.getenv("CRAWLER_MARKDOWNIFY", "false").lower() == "true"
+        # Auto-switch to markdown if tables or lists are present
+        use_markdown = bool(tree.css("table,ul,ol"))
         if use_markdown:
             try:
                 from markdownify import markdownify as md
@@ -200,24 +213,20 @@ class CrawlerService:
             return True
         # Heuristic for SPA shells
         tree = HTMLParser(html)
-        low_text = len(tree.text(strip=True)) < int(os.getenv("CRAWLER_HTTP_MIN_CHARS", "200"))
-        if low_text:
-            selectors = [s.strip() for s in os.getenv("CRAWLER_WAIT_SELECTORS", "").split(",") if s.strip()]
-            for sel in selectors:
-                if tree.css_first(sel):
-                    return False
+        text_len = len(tree.text(strip=True))
+        html_len = len(html)
+        # If text is very sparse relative to HTML, assume SPA shell
+        low_text_ratio = (text_len / max(1, html_len)) < 0.01
+        low_text_abs = text_len < 200
         spa_markers = ["id=\"root\"", "id=\"app\"", "data-reactroot", "data-v-app"]
-        if any(marker in html for marker in spa_markers) and low_text:
+        if any(marker in html for marker in spa_markers) and (low_text_ratio or low_text_abs):
             return True
-        return low_text
+        return low_text_ratio or low_text_abs
 
     async def _fetch_static(self, url: str, proxy: str = None) -> Optional[dict]:
         """Fast-path: attempt SSR HTML fetch via aiohttp before Playwright."""
         headers = {
-            "User-Agent": os.getenv(
-                "CRAWLER_HTTP_USER_AGENT",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         timeout = aiohttp.ClientTimeout(total=12)
         try:

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class VisionModel:
     def __init__(self, model_name: str = None):
-        self.backend = (os.getenv("VISION_BACKEND", "blip")).lower()
+        self.backend = (os.getenv("VISION_BACKEND", "auto")).lower()
         requested_backend = self.backend
         self.fallback_model = os.getenv(
             "VISION_FALLBACK_MODEL", "Salesforce/blip-image-captioning-base"

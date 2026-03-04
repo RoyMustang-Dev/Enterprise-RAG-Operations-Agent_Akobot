@@ -33,3 +33,9 @@ Timestamp: 2026-03-04T13:21:52
 Total Time: 25.63s
 Pages: 38
 Status: success
+## Phase 0 - Crawler Baseline (3 runs)
+Timestamp: 2026-03-04T14:04:51
+Run 1: 26.82s (pages 38, success)
+Run 2: 25.18s (pages 38, success)
+Run 3: 27.30s (pages 38, success)
+Median: 26.82s

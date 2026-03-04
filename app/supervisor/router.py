@@ -16,6 +16,9 @@ from app.infra.database import get_chat_history, save_chat_turn
 from app.prompt_engine.guard import PromptInjectionGuard
 from app.prompt_engine.rewriter import PromptRewriter
 from app.supervisor.intent import IntentClassifier
+from app.supervisor.source_scope import SourceScopeClassifier
+from app.infra.history_budget import trim_history_by_token_budget
+from app.infra.logging_utils import stage_info
 from app.supervisor.planner import AdaptivePlanner
 from app.agents.rag import RAGAgent
 from app.agents.coder import CoderAgent
@@ -37,6 +40,7 @@ class ExecutionGraph:
         self.guard = PromptInjectionGuard()
         self.rewriter = PromptRewriter()
         self.classifier = IntentClassifier()
+        self.source_scope = SourceScopeClassifier()
         self.complexity = ComplexityClassifier()
         self.planner = AdaptivePlanner()
         self.rag_agent = RAGAgent()
@@ -73,14 +77,8 @@ class ExecutionGraph:
 
         safe_history = persisted_history + (chat_history or [])
         safe_history.append({"role": "user", "content": query})
-        # Keep only the most recent N turns (user+assistant pairs)
-        try:
-            max_turns = int(os.getenv("CHAT_HISTORY_MAX_TURNS", "5"))
-        except Exception:
-            max_turns = 5
-        max_messages = max_turns * 2
-        if max_messages > 0 and len(safe_history) > max_messages:
-            safe_history = safe_history[-max_messages:]
+        # Token-aware trimming (keeps as much history as fits in the budget)
+        safe_history = trim_history_by_token_budget(safe_history)
         
         state: AgentState = {
             "session_id": session_id,
@@ -139,8 +137,10 @@ class ExecutionGraph:
                 risky_phrases = [p.strip().lower() for p in risky_phrases_env.split(",") if p.strip()]
                 q = (query or "").lower()
                 if soft_allow and any(s in q for s in safe_phrases) and not any(r in q for r in risky_phrases):
+                    stage_info(logger, "ROUTER:GUARD", "action=soft_allow")
                     logger.warning("[ROUTER] Guard flagged safe-looking prompt; soft-allow enabled.")
                 else:
+                    stage_info(logger, "ROUTER:GUARD", "action=block")
                     logger.warning(f"[ROUTER] Guard intercepted payload. Flagged as: {safety_report.get('categories')}")
                     state["answer"] = "Security Exception: Your request violates Enterprise parameters."
                     state["confidence"] = 1.0
@@ -152,6 +152,7 @@ class ExecutionGraph:
                             pass
                     return state
             else:
+                stage_info(logger, "ROUTER:GUARD", "action=block")
                 logger.warning(f"[ROUTER] Guard intercepted payload. Flagged as: {safety_report.get('categories')}")
                 state["answer"] = "Security Exception: Your request violates Enterprise parameters."
                 state["confidence"] = 1.0
@@ -172,6 +173,7 @@ class ExecutionGraph:
 
         state["intent"] = intent_report.get("intent", "rag_question")
         state["optimizations"]["complexity_score"] = complexity_score
+        stage_info(logger, "ROUTER:INTENT", f"intent={state['intent']} conf={intent_report.get('confidence')}")
         
         # -------------------------------------------------------------
         # STEP 3: ADAPTIVE PLANNING (Dynamic Routing)
@@ -180,9 +182,23 @@ class ExecutionGraph:
         state["reasoning_effort"] = plan.get("reasoning_effort", state["reasoning_effort"])
         if plan.get("override_model"):
             state["optimizations"]["override_model"] = plan["override_model"]
-        if state.get("extra_collections") and plan.get("route") == "out_of_scope":
-            logger.info("[ROUTER] File context present; overriding out_of_scope to rag_agent.")
-            plan["route"] = "rag_agent"
+        stage_info(logger, "ROUTER:PLAN", f"route={plan.get('route')} effort={state['reasoning_effort']}")
+        if plan.get("route") == "out_of_scope":
+            # If we have any file/session context, always favor RAG.
+            if state.get("extra_collections") or state.get("tenant_id"):
+                logger.info("[ROUTER] Tenant/session context present; overriding out_of_scope to rag_agent.")
+                plan["route"] = "rag_agent"
+
+        # Decide retrieval scope using LLM classifier (no hardcoded keyword rules)
+        try:
+            has_session_files = bool(state.get("extra_collections"))
+            scope_report = await self.source_scope.classify(query, has_session_files=has_session_files)
+            state["retrieval_scope"] = scope_report.get("scope", "both")
+            state["optimizations"]["retrieval_scope"] = state["retrieval_scope"]
+            stage_info(logger, "ROUTER:SCOPE", f"scope={state['retrieval_scope']} conf={scope_report.get('confidence')}")
+        except Exception as e:
+            logger.warning(f"[ROUTER] Source scope classifier failed; defaulting to 'both': {e}")
+            state["retrieval_scope"] = "both"
 
         # -------------------------------------------------------------
         # STEP 4: PROMPT OPTIMIZATION (MoE Rewriter)
@@ -191,6 +207,7 @@ class ExecutionGraph:
             # Generate 3 canonical prompts with explicit Temp/Token Metadata
             rewrite_data = await self.rewriter.rewrite(query, state["intent"])
             state["optimized_prompts"] = rewrite_data.get("prompts", {})
+            stage_info(logger, "ROUTER:REWRITE", "rewriter_completed=true")
         
         # -------------------------------------------------------------
         # STEP 5: EXECUTION FORK (MoE / ReAct Routing)

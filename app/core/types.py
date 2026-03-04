@@ -48,6 +48,7 @@ class AgentState(TypedDict):
     context_chunks: List[Dict[str, Any]] # The raw dictionaries grabbed from Qdrant Vector Store
     context_text: str                   # The formatted string block containing cited context
     extra_collections: List[str]        # Optional extra Qdrant collections to include in retrieval
+    retrieval_scope: Optional[str]      # 'kb_only' | 'session_only' | 'both'
     
     # Evaluation Mechanics
     confidence: float                   # 0.00 to 1.00 numeric confidence of the answer

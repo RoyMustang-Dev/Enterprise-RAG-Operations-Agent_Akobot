@@ -9,6 +9,7 @@ import time
 import logging
 from datetime import datetime
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.ingestion.loader import load_document
 from app.ingestion.chunker import chunk_text
@@ -83,49 +84,58 @@ class IngestionPipeline:
             job_tracker.setdefault("logs", []).append(msg)
         
         # -------------------------------------------------------------------------
-        # 1. & 2. Loading and Chunking Sequences Loop
+        # 1. & 2. Loading and Chunking Sequences (Parallelized)
         # -------------------------------------------------------------------------
-        for i, file_path in enumerate(file_paths):
+        def _process_file(idx: int, path: str):
             try:
-                msg = f"Processing Data File: {file_path}"
-                logger.info(msg)
-                if job_tracker is not None:
-                    job_tracker.setdefault("logs", []).append(msg)
-                # Dispatch mapping load based on file extension
-                text = load_document(file_path)
+                text = load_document(path)
                 if not text:
-                    print(f"Warning Sequence: No text successfully extracted natively from {file_path}")
-                    continue
-                    
-                # Subdivide massive string payload into mathematical chunks
+                    return idx, [], []
                 chunks = chunk_text(text)
                 if not chunks:
-                    continue
-                
-                # Append default tracking metadata required by the Retrieval Tool filtering logic
-                base_meta = metadatas[i] if metadatas and i < len(metadatas) else {}
-                source_name = os.path.basename(file_path)
+                    return idx, [], []
+                base_meta = metadatas[idx] if metadatas and idx < len(metadatas) else {}
+                source_name = os.path.basename(path)
                 ext = os.path.splitext(source_name)[1].lower().lstrip(".")
                 creation_year = str(datetime.utcnow().year)
-                base_meta.update({
+                base_meta = {
+                    **base_meta,
                     "source": source_name,
-                    "file_path": file_path,
+                    "file_path": path,
                     "ingested_at": time.time(),
                     "document_type": ext or "txt",
                     "source_domain": base_meta.get("source_domain", "uploaded_file"),
                     "author": base_meta.get("author", "unknown"),
                     "creation_year": str(base_meta.get("creation_year", creation_year)),
-                })
-                
-                # Flatten the data struct
-                for chunk in chunks:
-                    all_chunks.append(chunk)
-                    all_metadatas.append(base_meta.copy())
-                    
-                total_chunks += len(chunks)
-                
+                }
+                metas = [base_meta.copy() for _ in chunks]
+                return idx, chunks, metas
             except Exception as e:
-                print(f"Error Pipeline extraction processing {file_path}: {e}")
+                logger.error(f"[INGESTION] Failed processing {path}: {e}")
+                return idx, [], []
+
+        cpu_cores = HardwareProbe.get_profile().get("cpu_cores", 4)
+        max_workers = max(1, min(len(file_paths), max(2, cpu_cores // 2)))
+        logger.info(f"[INGESTION] Parallel loader workers={max_workers}")
+        if job_tracker is not None:
+            job_tracker.setdefault("logs", []).append(f"Parallel loader workers={max_workers}")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for i, file_path in enumerate(file_paths):
+                msg = f"Processing Data File: {file_path}"
+                logger.info(msg)
+                if job_tracker is not None:
+                    job_tracker.setdefault("logs", []).append(msg)
+                futures.append(executor.submit(_process_file, i, file_path))
+
+            for future in as_completed(futures):
+                _, chunks, metas = future.result()
+                if not chunks:
+                    continue
+                all_chunks.extend(chunks)
+                all_metadatas.extend(metas)
+                total_chunks += len(chunks)
 
         if not all_chunks:
             logger.warning("No valid data chunks generated to actively ingest.")

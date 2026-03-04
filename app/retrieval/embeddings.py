@@ -141,6 +141,9 @@ class EmbeddingModel:
                 
             return all_embeddings
 
+        # Ensure model is initialized on the main thread before parallel work
+        _ = self.model
+
         # Phase 13: Hardware Execution Sub-Routing
         if self.device in ["cuda", "mps"]:
             # Native GPU Tensor processing devours entire arrays aggressively

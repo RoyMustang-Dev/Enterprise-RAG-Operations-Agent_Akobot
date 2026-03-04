@@ -1,0 +1,8 @@
+[
+  {"user": "Summarize the attached document only.", "assistant_output": {"scope": "session_only", "confidence": 0.9}},
+  {"user": "Use only the knowledge base to answer.", "assistant_output": {"scope": "kb_only", "confidence": 0.9}},
+  {"user": "Compare the uploaded file with our internal docs.", "assistant_output": {"scope": "both", "confidence": 0.9}},
+  {"user": "Recommend courses based on the attached resume and the KB.", "assistant_output": {"scope": "both", "confidence": 0.85}},
+  {"user": "Answer strictly from the uploaded spreadsheet.", "assistant_output": {"scope": "session_only", "confidence": 0.88}},
+  {"user": "Summarize the company policy in the knowledge base.", "assistant_output": {"scope": "kb_only", "confidence": 0.85}}
+]

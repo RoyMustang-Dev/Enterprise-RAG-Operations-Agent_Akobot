@@ -36,9 +36,10 @@ except Exception:
     # Optional dependency in constrained environments; service can still run with injected env vars.
     pass
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # Patch qdrant-client grpc annotations before any qdrant imports
 from app.infra.qdrant_patch import ensure_qdrant_grpc_compat
@@ -76,6 +77,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("app")
 
+# Reduce noisy library logs for readability
+for noisy_name in [
+    "httpx",
+    "urllib3",
+    "asyncio",
+    "sentence_transformers",
+    "qdrant_client",
+    "uvicorn.access",
+]:
+    logging.getLogger(noisy_name).setLevel(logging.WARNING)
+
 # Configure CORS
 cors_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
 allow_credentials = os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true"
@@ -90,6 +102,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -----------------------------------------------------------------------------
+# Metrics (Prometheus)
+# -----------------------------------------------------------------------------
+REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"],
+)
+REQUEST_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency in seconds",
+    ["method", "path"],
+)
+
 
 # -----------------------------------------------------------------------------
 # Router Mounting
@@ -132,6 +159,19 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     elapsed = round((time.perf_counter() - start) * 1000, 3)
     logger.info(f"{request.method} {request.url.path} -> {response.status_code} ({elapsed} ms)")
+    try:
+        elapsed_sec = elapsed / 1000.0
+        REQUEST_COUNT.labels(
+            method=request.method,
+            path=request.url.path,
+            status=str(response.status_code),
+        ).inc()
+        REQUEST_LATENCY.labels(
+            method=request.method,
+            path=request.url.path,
+        ).observe(elapsed_sec)
+    except Exception:
+        pass
     return response
 
 # -----------------------------------------------------------------------------
@@ -162,6 +202,11 @@ async def health_check():
             "embeddings": "BAAI/bge-large-en-v1.5"
         }
     }
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 
 @app.get("/health", tags=["Health"], include_in_schema=False)

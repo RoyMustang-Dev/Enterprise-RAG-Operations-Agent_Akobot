@@ -8,6 +8,7 @@ It ensures that the mathematical provenance arrays returned by the 70B model
 are injected as Markdown `[Citation: ID]` inline links within the raw text.
 """
 import logging
+from app.infra.logging_utils import stage_info
 from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ class ResponseFormatter:
          # Citations are injected natively in Synthesis wrapper, we pull the direct answer here
          formatted_answer = state.get("answer", "")
          claims = state.get("verification_claims", [])
+         stage_info(logger, "RAG:FORMAT", "formatting_response")
          
          # Append visual warning if the Independent Verifier caught a logic flaw
          if state.get("is_hallucinated", False):

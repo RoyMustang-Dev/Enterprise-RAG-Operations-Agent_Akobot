@@ -5,7 +5,21 @@ Responsible for slicing massive raw document strings into mathematically bounded
 WARNING: This uses a legacy word-count splitter. Phase 8 will introduce 
 Token-Aware `RecursiveCharacterTextSplitter` to align perfectly with the BAAI Embedding token ceilings.
 """
-from typing import List, Dict
+from typing import List, Dict, Optional
+import threading
+
+_TOKENIZER_LOCK = threading.Lock()
+_TOKENIZER = None
+
+def _get_tokenizer():
+    global _TOKENIZER
+    if _TOKENIZER is not None:
+        return _TOKENIZER
+    with _TOKENIZER_LOCK:
+        if _TOKENIZER is None:
+            from transformers import AutoTokenizer
+            _TOKENIZER = AutoTokenizer.from_pretrained("BAAI/bge-large-en-v1.5")
+    return _TOKENIZER
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
     """
@@ -27,10 +41,7 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
-        from transformers import AutoTokenizer
-        
-        # Load the exact tokenizer used by our EmbeddingModel
-        tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-large-en-v1.5")
+        tokenizer = _get_tokenizer()
         
         splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
             tokenizer,

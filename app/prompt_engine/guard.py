@@ -24,7 +24,7 @@ class PromptInjectionGuard:
     If 'is_malicious' is True, the process throws a 403 Forbidden automatically.
     """
     
-    def __init__(self, model_override: str = "llama-3.1-8b-instant"):
+    def __init__(self, model_override: str = "llama-3.1-8b-instant", escalation_model: str = "llama-3.3-70b-versatile"):
         """
         Dynamically binds to the Groq API Key required for inference.
         """
@@ -35,6 +35,7 @@ class PromptInjectionGuard:
         # Hardcoding the model specifically designated for Safety logic
         # If Groq rotates the naming convention, update this string.
         self.model_id = model_override
+        self.escalation_model_id = escalation_model
         
         # The rigid JSON schema instructed in the rag-implementation blueprint
         from app.prompt_engine.groq_prompts.config import get_compiled_prompt
@@ -62,22 +63,28 @@ class PromptInjectionGuard:
             "Content-Type": "application/json"
         }
         
-        payload = {
-            "model": self.model_id,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            # Strict determinism required for security filters
-            "temperature": 0.0,
-            "max_tokens": 200,
-            "response_format": {"type": "json_object"}
-        }
+        def _payload(model_id: str):
+            return {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                # Strict determinism required for security filters
+                "temperature": 0.0,
+                "max_tokens": 200,
+                "response_format": {"type": "json_object"}
+            }
         
         try:
             logger.info(f"[PROMPT GUARD] Evaluating prompt against {self.model_id}")
             # Intentionally synchronous mapping. We block the DAG until Safety confirms authorization.
-            response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=5)
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=_payload(self.model_id),
+                timeout=5
+            )
             response.raise_for_status()
             
             raw_content = response.json()["choices"][0]["message"]["content"]
@@ -86,6 +93,23 @@ class PromptInjectionGuard:
             # Log successful evasions actively for SOC compliance
             if result.get("is_malicious"):
                 logger.warning(f"[PROMPT GUARD] Malicious intent intercepted! Categories: {result.get('categories')}")
+                # Escalate to a larger model to reduce false positives
+                try:
+                    logger.info(f"[PROMPT GUARD] Escalating guard decision to {self.escalation_model_id}")
+                    esc = requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers=headers,
+                        json=_payload(self.escalation_model_id),
+                        timeout=8
+                    )
+                    esc.raise_for_status()
+                    esc_raw = esc.json()["choices"][0]["message"]["content"]
+                    esc_result = json.loads(esc_raw)
+                    if not esc_result.get("is_malicious"):
+                        logger.info("[PROMPT GUARD] Escalation override: allow")
+                        return {"is_malicious": False, "action": "allow", "evidence": "Escalation override"}
+                except Exception as e:
+                    logger.warning(f"[PROMPT GUARD] Escalation failed: {e}")
                 
             return result
             

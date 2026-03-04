@@ -137,14 +137,9 @@ def _chunk_text_for_stream(text: str, size: int = 120):
 # -----------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     query: str = Field(..., description="The user's raw prompt.")
-    chat_history: Optional[List[Dict[str, Any]]] = Field(
-        default=[],
-        description="Previous conversational turns. Example: "
-                    "[{\"role\":\"user\",\"content\":\"Hi\"},{\"role\":\"assistant\",\"content\":\"Hello\"}]"
-    )
     model_provider: Literal["groq", "openai", "anthropic", "gemini", "auto"] = Field(
-        default="groq",
-        description="Requested provider. Use 'auto' to enable provider auto-routing (when PROVIDER_AUTO_ROUTING=true).",
+        default="auto",
+        description="Requested provider. Use 'auto' to let the system choose the best available provider.",
     )
     session_id: Optional[str] = Field(default=None, description="Optional client session identifier for telemetry correlation.")
     stream: Optional[bool] = Field(default=False, description="Enable server-sent events (SSE) streaming output.")
@@ -157,8 +152,7 @@ class ChatRequest(BaseModel):
         "json_schema_extra": {
             "example": {
                 "query": "Summarize Updated_Resume_DS.pdf.",
-                "chat_history": [],
-                "model_provider": "groq",
+                "model_provider": "auto",
                 "session_id": "session-123",
                 "stream": False,
                 "reranker_model_name": "llama-3.1-8b-instant"
@@ -284,16 +278,11 @@ class FeedbackRequest(BaseModel):
                         "type": "object",
                         "properties": {
                             "query": {"type": "string"},
-                            "chat_history": {
-                                "type": "string",
-                                "description": "JSON list of messages. Example: "
-                                               "[{\"role\":\"user\",\"content\":\"Hi\"},{\"role\":\"assistant\",\"content\":\"Hello\"}]"
-                            },
                             "model_provider": {
                                 "type": "string",
                                 "enum": ["groq", "openai", "anthropic", "gemini", "auto"],
-                                "default": "groq",
-                                "description": "Provider selection. Use auto when PROVIDER_AUTO_ROUTING=true."
+                                "default": "auto",
+                                "description": "Provider selection. Use auto to let the system choose the best available provider."
                             },
                             "session_id": {"type": "string"},
                             "image_mode": {
@@ -359,7 +348,6 @@ async def chat_endpoint(
             raw = await http_request.json()
             parsed = ChatRequest(**raw)
             query = parsed.query
-            chat_history_list = parsed.chat_history or []
             model_provider = parsed.model_provider
             session_id = parsed.session_id or str(uuid.uuid4())
             stream = bool(parsed.stream)
@@ -370,7 +358,6 @@ async def chat_endpoint(
         try:
             form = await http_request.form()
             query = form.get("query")
-            chat_history = form.get("chat_history")
             model_provider = form.get("model_provider")
             session_id = form.get("session_id")
             image_mode = form.get("image_mode") or "auto"
@@ -411,13 +398,7 @@ async def chat_endpoint(
     if image_files:
         logger.info(f"[CHAT DEBUG] Uploaded images: {[f.filename for f in image_files]}")
 
-    if chat_history:
-        try:
-            chat_history_list = json.loads(chat_history)
-            if not isinstance(chat_history_list, list):
-                chat_history_list = []
-        except Exception:
-            chat_history_list = []
+    # chat_history is auto-managed server-side via session history; client input is ignored
 
     model_provider = (model_provider or "groq").lower()
     session_id = session_id or str(uuid.uuid4())
@@ -478,7 +459,6 @@ async def chat_endpoint(
                 image_mode=image_mode,
             )
             extra_collections = [ingest_info["collection_name"]]
-            force_session_context = True
             logger.info(
                 f"[CHAT DEBUG] Ingested files: session_id={session_id} "
                 f"collection={ingest_info.get('collection_name')} chunks_added={ingest_info.get('chunks_added')} "
@@ -538,15 +518,8 @@ async def chat_endpoint(
                 except Exception:
                     pass
 
-        # Guard: If query references file/document and no uploaded context exists, return a clear error.
-        file_keywords = [
-            "file", "files", "document", "documents", "pdf", "excel", "xlsx", "csv", "tsv",
-            "spreadsheet", "sheet", "docx", "attached", "upload", "image", "photo", "picture"
-        ]
-        q_lower = (query or "").lower()
-        enforce_file_session = os.getenv("ENFORCE_FILE_SESSION", "false").lower() == "true"
-        if enforce_file_session and any(k in q_lower for k in file_keywords) and not extra_collections:
-            raise HTTPException(status_code=400, detail="No uploaded file detected for this session.")
+        # Note: We do NOT block normal RAG when no files are attached.
+        # If files/images are present, we route through multimodal flows above.
 
         orchestrator = _get_orchestrator()
         result = await orchestrator.invoke(
@@ -575,30 +548,33 @@ async def chat_endpoint(
         )
 
         elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
-        telemetry.emit(
-            TelemetryLogRecord(
-                timestamp=ObservabilityLayer.get_timestamp(),
-                session_id=session_id,
-                user_id=x_user_id or "anonymous_user",
-                query=query,
-                intent_detected=(result.get("intent") or "unknown"),
-                routed_agent=result.get("optimizations", {}).get("agent_routed", "unknown"),
-                latency_ms=elapsed_ms,
-                llm_time_ms=float(result.get("latency_optimizations", {}).get("llm_time_ms", 0.0)),
-                retrieval_time_ms=float(result.get("latency_optimizations", {}).get("retrieval_time_ms", 0.0)),
-                rerank_time_ms=float(result.get("latency_optimizations", {}).get("rerank_time_ms", 0.0)),
-                verifier_score=float(result.get("confidence", 0.0)),
-                hallucination_score=bool(result.get("is_hallucinated", False)),
-                hardware_used="gpu" if HardwareProbe.detect_environment().get("primary_device") in ["cuda", "mps"] else "cpu",
-                complexity_score=float(result.get("optimizations", {}).get("complexity_score", 0.0)),
-                metadata_filters_applied=result.get("optimizations", {}).get("metadata_filters", {}),
-                reward_score=float(result.get("optimizations", {}).get("reward_score", 0.0)),
-                tokens_input=int(result.get("optimizations", {}).get("tokens_input", 0)),
-                tokens_output=int(result.get("optimizations", {}).get("tokens_output", 0)),
-                temperature_used=float(result.get("optimizations", {}).get("temperature_used", 0.0)),
-                answer_preview=(result.get("answer", "") or "")[:500],
+        try:
+            telemetry.emit(
+                TelemetryLogRecord(
+                    timestamp=ObservabilityLayer.get_timestamp(),
+                    session_id=session_id,
+                    user_id=x_user_id or "anonymous_user",
+                    query=query,
+                    intent_detected=(result.get("intent") or "unknown"),
+                    routed_agent=result.get("optimizations", {}).get("agent_routed", "unknown"),
+                    latency_ms=elapsed_ms,
+                    llm_time_ms=float(result.get("latency_optimizations", {}).get("llm_time_ms", 0.0)),
+                    retrieval_time_ms=float(result.get("latency_optimizations", {}).get("retrieval_time_ms", 0.0)),
+                    rerank_time_ms=float(result.get("latency_optimizations", {}).get("rerank_time_ms", 0.0)),
+                    verifier_score=float(result.get("confidence", 0.0)),
+                    hallucination_score=bool(result.get("is_hallucinated", False)),
+                    hardware_used="gpu" if HardwareProbe.detect_environment().get("primary_device") in ["cuda", "mps"] else "cpu",
+                    complexity_score=float(result.get("optimizations", {}).get("complexity_score", 0.0)),
+                    metadata_filters_applied=result.get("optimizations", {}).get("metadata_filters", {}),
+                    reward_score=float(result.get("optimizations", {}).get("reward_score", 0.0)),
+                    tokens_input=int(result.get("optimizations", {}).get("tokens_input", 0) or 0),
+                    tokens_output=int(result.get("optimizations", {}).get("tokens_output", 0) or 0),
+                    temperature_used=float(result.get("optimizations", {}).get("temperature_used", 0.0) or 0.0),
+                    answer_preview=(result.get("answer", "") or "")[:500],
+                )
             )
-        )
+        except Exception as e:
+            logger.warning(f"[TELEMETRY] Failed to emit log record: {e}")
 
         if stream:
             async def event_gen():

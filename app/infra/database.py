@@ -94,6 +94,22 @@ def init_session_collections_db():
     conn.commit()
     conn.close()
 
+def init_session_cache_db():
+    """Ensures the session cache table exists."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS session_cache (
+        session_id TEXT PRIMARY KEY,
+        cache_json TEXT,
+        last_query_hash TEXT,
+        created_at REAL,
+        updated_at REAL
+    )
+    """)
+    conn.commit()
+    conn.close()
+
 def enable_wal():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -231,6 +247,55 @@ def get_session_collection(session_id: str):
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+def get_session_cache(session_id: str):
+    init_session_cache_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM session_cache WHERE session_id=?", (session_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    cache_payload = json.loads(row["cache_json"]) if row["cache_json"] else {}
+    return {
+        "session_id": row["session_id"],
+        "cache": cache_payload,
+        "last_query_hash": row["last_query_hash"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+def upsert_session_cache(session_id: str, cache_payload: dict, last_query_hash: str = None, created_at: float = None, updated_at: float = None):
+    init_session_cache_db()
+    now = time.time()
+    created_at = created_at or now
+    updated_at = updated_at or now
+    cache_json = json.dumps(cache_payload)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO session_cache (session_id, cache_json, last_query_hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+            cache_json=excluded.cache_json,
+            last_query_hash=excluded.last_query_hash,
+            updated_at=excluded.updated_at
+        """,
+        (session_id, cache_json, last_query_hash, created_at, updated_at),
+    )
+    conn.commit()
+    conn.close()
+
+def delete_session_cache(session_id: str):
+    init_session_cache_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM session_cache WHERE session_id=?", (session_id,))
+    conn.commit()
+    conn.close()
 
 def delete_session_collection_by_collection(collection_name: str):
     init_session_collections_db()

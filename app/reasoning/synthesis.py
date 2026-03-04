@@ -14,6 +14,7 @@ load_dotenv(override=True)
 
 import json
 import logging
+from app.infra.logging_utils import stage_info, stage_warn
 import requests
 import tiktoken
 from tenacity import retry, wait_exponential, stop_after_attempt
@@ -41,7 +42,7 @@ class SynthesisEngine:
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
     def _execute_api_call(self, headers: dict, payload: dict) -> requests.Response:
         """Executes the POST HTTP layer securely guarded by an exponential backoff decorator."""
-        logger.info("[SYNTHESIS] Transmitting native generation inference request...")
+        stage_info(logger, "RAG:SYNTH", "api_call")
         # 30 second timeout as 8K token context evaluation requires heavy vRAM latency on Groq's backend
         response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
         
@@ -104,26 +105,33 @@ class SynthesisEngine:
                 {"role": "user", "content": f"CONTEXT DOCUMENTS:\n{context_string}\n\nUSER_PROMPT: {user_prompt}"}
             ],
             "temperature": active_temp, # Bounded creativity
-            "max_completion_tokens": 4096,
-            "response_format": {"type": "json_object"}
+            "max_completion_tokens": 2048
         }
         
         try:
-            logger.info(f"[SYNTHESIS] Inference payload configured with raw context boundary.")
+            stage_info(logger, "RAG:SYNTH", "payload_ready")
             response = self._execute_api_call(headers, payload)
-            
+
             response_json = response.json()
             raw_content = response_json["choices"][0]["message"]["content"]
-            parsed_result = json.loads(raw_content)
+            try:
+                parsed_result = json.loads(raw_content)
+                answer_text = parsed_result.get("answer", "")
+                confidence = parsed_result.get("confidence", 0.0)
+            except Exception:
+                # Fallback: treat raw content as the answer if JSON parsing fails
+                stage_warn(logger, "RAG:SYNTH", "non_json_output_fallback")
+                answer_text = raw_content.strip()
+                confidence = 0.0
+
             # Approx token counts (input from prompt/context, output from answer text)
             tokens_input = system_overhead + user_prompt_overhead + cost_sum
-            answer_text = parsed_result.get("answer", "")
             tokens_output = len(self.tokenizer.encode(answer_text)) if answer_text else 0
 
             return {
-                "answer": parsed_result.get("answer", ""),
+                "answer": answer_text,
                 "provenance": provenance,
-                "confidence": parsed_result.get("confidence", 0.0),
+                "confidence": confidence,
                 "tokens_input": tokens_input,
                 "tokens_output": tokens_output,
                 "temperature_used": active_temp,
@@ -131,5 +139,30 @@ class SynthesisEngine:
             }
             
         except Exception as e:
-             logger.error(f"[SYNTHESIS] Execution completely crashed: {e}")
-             return {"answer": "Internal Generation Error validating tokens.", "provenance": provenance, "confidence": 0.0, "tokens_input": 0, "tokens_output": 0, "temperature_used": active_temp, "model_used": active_model}
+             stage_warn(logger, "RAG:SYNTH", f"crash={e}")
+             # Extractive fallback to avoid hard failure
+             fallback_bits = []
+             for chunk in context_chunks[:3]:
+                 text = (chunk.get("page_content") or "").strip()
+                 if text:
+                     fallback_bits.append(text[:400])
+             if fallback_bits:
+                 fallback_answer = "Extractive summary (LLM unavailable):\n\n" + "\n\n".join(fallback_bits)
+                 return {
+                     "answer": fallback_answer,
+                     "provenance": provenance,
+                     "confidence": 0.0,
+                     "tokens_input": 0,
+                     "tokens_output": 0,
+                     "temperature_used": active_temp,
+                     "model_used": active_model,
+                 }
+             return {
+                 "answer": "Internal Generation Error validating tokens.",
+                 "provenance": provenance,
+                 "confidence": 0.0,
+                 "tokens_input": 0,
+                 "tokens_output": 0,
+                 "temperature_used": active_temp,
+                 "model_used": active_model,
+             }

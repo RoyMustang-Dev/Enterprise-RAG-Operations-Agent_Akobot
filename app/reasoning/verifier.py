@@ -12,6 +12,7 @@ load_dotenv(override=True)
 
 import json
 import logging
+from app.infra.logging_utils import stage_info, stage_warn
 import requests
 from typing import Dict, Any, List
 
@@ -61,12 +62,12 @@ class HallucinationVerifier:
         }
         
         try:
-            logger.info("[VERIFIER] Executing logic boundary verification... (Groq Fallback)")
+            stage_info(logger, "RAG:VERIFY", "groq_fallback=true")
             response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=12)
             response.raise_for_status()
             return json.loads(response.json()["choices"][0]["message"]["content"])
         except Exception as e:
-            logger.error(f"[VERIFIER] Execution failure: {e}")
+            stage_warn(logger, "RAG:VERIFY", f"fallback_error={e}")
             return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}
             
     def _invoke_sarvam(self, payload_str: str) -> Dict[str, Any]:
@@ -84,7 +85,7 @@ class HallucinationVerifier:
         }
         
         try:
-            logger.info("[VERIFIER] Executing logic boundary line-by-line verification... (Sarvam M Native)")
+            stage_info(logger, "RAG:VERIFY", "sarvam_native=true")
             response = requests.post("https://api.sarvam.ai/v1/chat/completions", headers=headers, json=payload, timeout=20)
             response.raise_for_status()
             
@@ -96,7 +97,7 @@ class HallucinationVerifier:
                 
             return json.loads(raw_text)
         except Exception as e:
-            logger.error(f"[VERIFIER] Sarvam execution failure: {e}. Falling back to Groq natively.")
+            stage_warn(logger, "RAG:VERIFY", f"sarvam_error={e} fallback_to_groq=true")
             if self.groq_key:
                 return self._invoke_groq_fallback(payload_str)
             return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}

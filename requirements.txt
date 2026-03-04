@@ -40,3 +40,4 @@ redis
 accelerate
 selectolax
 pdfplumber>=0.11.0
+prometheus-client>=0.20.0
