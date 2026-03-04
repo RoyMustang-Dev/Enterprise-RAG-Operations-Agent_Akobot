@@ -1,4 +1,4 @@
-"""
+﻿"""
 Crawler Service Component.
 
 Refactored for High Performance & Reliability:
@@ -201,6 +201,11 @@ class CrawlerService:
         # Heuristic for SPA shells
         tree = HTMLParser(html)
         low_text = len(tree.text(strip=True)) < int(os.getenv("CRAWLER_HTTP_MIN_CHARS", "200"))
+        if low_text:
+            selectors = [s.strip() for s in os.getenv("CRAWLER_WAIT_SELECTORS", "").split(",") if s.strip()]
+            for sel in selectors:
+                if tree.css_first(sel):
+                    return False
         spa_markers = ["id=\"root\"", "id=\"app\"", "data-reactroot", "data-v-app"]
         if any(marker in html for marker in spa_markers) and low_text:
             return True
@@ -258,19 +263,18 @@ class CrawlerService:
     # ---------------- WORKER ---------------- #
 
     async def _worker(self, wid, queue, context, session_id, rp,
-                      visited, visited_lock, db_queue, simulate, stop_event, max_urls: int, start_ts: float, max_seconds: float, http_only: bool):
+                      visited, visited_lock, db_queue, stop_event, max_urls: int, start_ts: float, max_seconds: float, http_only: bool):
 
-        # Block resources for speed if not in simulation mode
-        if not simulate:
-            try:
-                async def _route_handler(route):
-                    if route.request.resource_type in {"image", "font", "media"}:
-                        await route.abort()
-                    else:
-                        await route.continue_()
-                await context.route("**/*", _route_handler)
-            except Exception:
-                pass
+        # Always block heavy resources for speed.
+        try:
+            async def _route_handler(route):
+                if route.request.resource_type in {"image", "font", "media"}:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await context.route("**/*", _route_handler)
+        except Exception:
+            pass
 
         page = await context.new_page()
 
@@ -412,10 +416,10 @@ class CrawlerService:
                     try:
                         if selectors:
                             for sel in selectors:
-                                await page.wait_for_selector(sel, timeout=5000)
+                                await page.wait_for_selector(sel, timeout=3000)
                                 break
                         else:
-                            await page.wait_for_load_state("networkidle", timeout=5000)
+                            await page.wait_for_load_state("networkidle", timeout=3000)
                     except Exception:
                         pass
                     if os.getenv("CRAWLER_SCROLL", "true").lower() == "true":
@@ -514,7 +518,7 @@ class CrawlerService:
 
             # Optimized Launch Options
             launch_options = {
-                "headless": not simulate,
+                "headless": True,
                 "args": ["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"]
             }
             
@@ -522,13 +526,12 @@ class CrawlerService:
 
             # High Concurrency unless simulating (Phase 13 Dynamic Hardware Hook)
             profile = HardwareProbe.get_profile()
-            NUM = profile.get("crawler_workers", 4) if not simulate else 2
+            NUM = profile.get("crawler_workers", 4)
             logger.info(f"[CRAWLER HARDWARE SCALE] Instantiating {NUM} parallel headless Chromium workers.")
             
             context_options = {}
-            if not simulate:
-                 # Add user agent to avoid basic blocks in headless
-                 context_options["user_agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            # Add user agent to avoid basic blocks in headless
+            context_options["user_agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             if self._proxy_pool:
                 # Playwright expects a single proxy per context; rotate per context.
                 context_options["proxy"] = {"server": random.choice(self._proxy_pool)}
@@ -541,7 +544,7 @@ class CrawlerService:
             workers = [
                 asyncio.create_task(
                     self._worker(i, queue, contexts[i], session_id,
-                                 rp, visited, visited_lock, db_queue, simulate, stop_event, max_urls, start_ts, max_seconds, http_only)
+                                 rp, visited, visited_lock, db_queue, stop_event, max_urls, start_ts, max_seconds, http_only)
                 )
                 for i in range(NUM)
             ]
