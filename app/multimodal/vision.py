@@ -7,16 +7,30 @@ Default is BLIP for low-VRAM environments; LLaVA can be enabled via env.
 import os
 import io
 import logging
+import base64
+import requests
 
 from PIL import Image
 
+try:
+    from transformers.utils import logging as hf_logging
+    hf_logging.set_verbosity_error()
+except Exception:
+    pass
+
 from app.infra.hardware import HardwareProbe
+
+# Reduce HF/transformers console noise
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 logger = logging.getLogger(__name__)
 
 
 class VisionModel:
     def __init__(self, model_name: str = None):
+        self.gemini_key = os.getenv("GEMINI_API_KEY")
+        self.vision_cloud_model = os.getenv("VISION_CLOUD_MODEL", "gemini-2.5-flash")
         self.backend = (os.getenv("VISION_BACKEND", "auto")).lower()
         requested_backend = self.backend
         self.fallback_model = os.getenv(
@@ -53,6 +67,8 @@ class VisionModel:
             f"[VISION] Configured backend={self.backend} (requested={requested_backend}) "
             f"model={self.model_name} device={self.device}"
         )
+        if self.gemini_key:
+            logger.info(f"[VISION] Gemini vision enabled model_id={self.vision_cloud_model}")
 
     @property
     def processor(self):
@@ -108,8 +124,56 @@ class VisionModel:
         if not image_bytes:
             raise ValueError("image_bytes cannot be empty.")
 
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         prompt = question or "Describe the image."
+
+                # Prefer Gemini vision when key exists (fallback to local models if it fails).
+        if self.gemini_key:
+            try:
+                b64 = base64.b64encode(image_bytes).decode("utf-8")
+                mime_type = "image/jpeg"
+                if image_bytes.startswith(b"\x89PNG"):
+                    mime_type = "image/png"
+                elif image_bytes.startswith(b"RIFF"):
+                    mime_type = "image/webp"
+
+                payload = {
+                    "contents": [
+                        {
+                            "parts": [
+                                {"text": prompt},
+                                {
+                                    "inlineData": {
+                                        "mimeType": mime_type,
+                                        "data": b64
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "generationConfig": {
+                        "maxOutputTokens": max_new_tokens,
+                        "temperature": 0.1
+                    }
+                }
+                resp = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{self.vision_cloud_model}:generateContent?key={self.gemini_key}",
+                    json=payload,
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                try:
+                    content = result["candidates"][0]["content"]["parts"][0]["text"]
+                    logger.info("[VISION] Gemini vision success; returning remote response.")
+                    return content.strip()
+                except Exception as parse_e:
+                    logger.warning(f"[VISION] Gemini vision parse error: {parse_e} raw={result}")
+            except Exception as e:
+                if not self.allow_fallback:
+                    raise RuntimeError(f"Gemini vision failed: {e}")
+                logger.warning(f"[VISION] Gemini vision failed, falling back to local: {e}")
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         text_prompt = f"USER: <image>\n{prompt}\nASSISTANT:"
 
         # Primary LLaVA path

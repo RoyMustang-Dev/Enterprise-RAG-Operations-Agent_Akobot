@@ -9,7 +9,8 @@ import logging
 import os
 import json
 import asyncio
-import aiohttp
+from app.infra.llm_client import achat_completion
+from app.infra.model_registry import get_phase_model
 from typing import List, Dict, Any
 from app.prompt_engine.groq_prompts.config import get_compiled_prompt
 
@@ -26,8 +27,11 @@ class SemanticReranker:
         """
         Instantiates the Meta-Ranker with an explicit model.
         """
-        self.api_key = os.getenv("GROQ_API_KEY")
-        self.model_name = model_name or os.getenv("RERANKER_MODEL_NAME", "llama-3.1-8b-instant")
+        phase = get_phase_model("meta_ranker")
+        self.provider = phase["provider"]
+        self.model_name = model_name or phase["model"]
+        self.temperature = phase.get("temperature", 0.0)
+        self.max_tokens = phase.get("max_tokens", 1024)
         
         # We explicitly load the optimized prompt logic containing strict JSON mappings
         self.system_prompt = get_compiled_prompt("meta_ranker", self.model_name)
@@ -36,7 +40,11 @@ class SemanticReranker:
 
     @classmethod
     def get_instance(cls, model_name: str = None):
+        phase = get_phase_model("meta_ranker")
         name = model_name or os.getenv("RERANKER_MODEL_NAME", "llama-3.1-8b-instant")
+        # If ModelsLab is active, prefer the phase model to avoid invalid Groq-only ids.
+        if phase.get("provider") == "modelslab":
+            name = phase.get("model", name)
         if name not in cls._instances:
             cls._instances[name] = cls(model_name=name)
         return cls._instances[name]
@@ -60,7 +68,7 @@ class SemanticReranker:
         if not context_chunks:
             return []
 
-        if os.getenv("RERANKER_ENABLED", "true").lower() != "true" or not self.api_key:
+        if os.getenv("RERANKER_ENABLED", "true").lower() != "true" or (not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY")):
             logger.info("[META-RANKER] Disabled via env or API key missing. Returning raw dense retrieval.")
             return context_chunks[:top_k]
             
@@ -71,53 +79,44 @@ class SemanticReranker:
             content = chunk.get("page_content", "")[:350].replace('\n', ' ')
             payload_string += f"[{i}] {content}\n"
             
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        request_body = {
-            "model": self.model_name,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": payload_string}
-            ],
-            "temperature": 0.0, # Complete determinism for structural rankings
-            "max_completion_tokens": 1024,
-            "response_format": {"type": "json_object"}
-        }
-        
         try:
             logger.info(f"[META-RANKER] Transmitting {len(context_chunks)} chunks to {self.model_name}...")
-            async with aiohttp.ClientSession() as session:
-                async with session.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=request_body, timeout=10) as response:
-                    response.raise_for_status()
-                    data = await response.json()
+            data = await achat_completion(
+                provider=self.provider,
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": payload_string},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+                timeout=10,
+            )
+            raw_content = data["choices"][0]["message"]["content"]
+            result = json.loads(raw_content)
+            ranked_list = result.get("ranked_chunks", [])
                     
-                    raw_content = data["choices"][0]["message"]["content"]
-                    result = json.loads(raw_content)
-                    ranked_list = result.get("ranked_chunks", [])
-                    
-                    # We map the JSON array of {"chunk_id": X, "rerank_score": Y} back to our native memory arrays
-                    scored_chunks = []
-                    for rank_data in ranked_list:
-                        c_id = rank_data.get("chunk_id")
-                        if c_id is not None and 0 <= c_id < len(context_chunks):
-                            chunk = context_chunks[int(c_id)]
-                            chunk["rerank_score"] = float(rank_data.get("rerank_score", 0.0))
-                            scored_chunks.append(chunk)
+            # We map the JSON array of {"chunk_id": X, "rerank_score": Y} back to our native memory arrays
+            scored_chunks = []
+            for rank_data in ranked_list:
+                c_id = rank_data.get("chunk_id")
+                if c_id is not None and 0 <= c_id < len(context_chunks):
+                    chunk = context_chunks[int(c_id)]
+                    chunk["rerank_score"] = float(rank_data.get("rerank_score", 0.0))
+                    scored_chunks.append(chunk)
 
-                    # Only filter if the LLM successfully ranked at least some chunks.
-                    if scored_chunks:
-                        # Filter dynamically just like we did for the Cross-Encoder (> 0.10)
-                        sorted_chunks = sorted(scored_chunks, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
-                        sorted_chunks = [ch for ch in sorted_chunks if ch.get("rerank_score", 0.0) > 0.10]
-                        final_chunks = sorted_chunks[:top_k]
-                        
-                        logger.info(f"[META-RANKER] Dropped {len(context_chunks) - len(final_chunks)} irrelevant chunks dynamically.")
-                        return final_chunks
-                    else:
-                        raise ValueError("LLM returned an empty rankings array representation.")
+            # Only filter if the LLM successfully ranked at least some chunks.
+            if scored_chunks:
+                # Filter dynamically just like we did for the Cross-Encoder (> 0.10)
+                sorted_chunks = sorted(scored_chunks, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+                sorted_chunks = [ch for ch in sorted_chunks if ch.get("rerank_score", 0.0) > 0.10]
+                final_chunks = sorted_chunks[:top_k]
+                
+                logger.info(f"[META-RANKER] Dropped {len(context_chunks) - len(final_chunks)} irrelevant chunks dynamically.")
+                return final_chunks
+            else:
+                raise ValueError("LLM returned an empty rankings array representation.")
                         
         except Exception as e:
              logger.error(f"[META-RANKER] LLM Judge execution crashed: {e}")

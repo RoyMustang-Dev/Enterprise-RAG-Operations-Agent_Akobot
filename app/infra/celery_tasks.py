@@ -62,7 +62,7 @@ def run_crawler_job(job_id: str, url: str, max_depth: int, save_folder: str, mod
         from app.ingestion.crawler_service import CrawlerService
         from app.ingestion.pipeline import IngestionPipeline
 
-        crawler = CrawlerService()
+        crawler = CrawlerService(tenant_id=tenant_id)
         pipeline = IngestionPipeline(tenant_id=tenant_id)
         reset_db = mode == "overwrite"
         is_first_batch = [True]

@@ -68,6 +68,7 @@ class MultimodalRouter:
         files: list,
         session_id: Optional[str] = None,
         image_mode: str = "auto",
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ingests multiple uploaded files into a single ephemeral session collection.
@@ -78,12 +79,12 @@ class MultimodalRouter:
         if not files:
             raise ValueError("No files provided.")
 
-        self.session_vectors.cleanup_expired()
-        session_id, store = self.session_vectors.get_or_create(session_id)
+        self.session_vectors.cleanup_expired(tenant_id=tenant_id)
+        session_id, store = self.session_vectors.get_or_create(session_id, tenant_id=tenant_id)
         # Refresh session mapping timestamp
         try:
             from app.infra.database import upsert_session_collection
-            upsert_session_collection(session_id, store.collection_name)
+            upsert_session_collection(session_id, store.collection_name, tenant_id=tenant_id)
         except Exception:
             pass
 

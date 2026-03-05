@@ -55,7 +55,7 @@ class ExecutionGraph:
         text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
         return text.strip()
         
-    async def invoke(self, query: str, chat_history: list = None, session_id: str = "", tenant_id: str = None, model_provider: str = "groq", extra_collections: list = None, reranker_profile: str = "auto", reranker_model_name: str = None, force_session_context: bool = False) -> AgentState:
+    async def invoke(self, query: str, chat_history: list = None, session_id: str = "", tenant_id: str = None, model_provider: str = "auto", extra_collections: list = None, reranker_profile: str = "auto", reranker_model_name: str = None, force_session_context: bool = False, streaming_callback=None) -> AgentState:
         """
         The formal entrypoint called by `app.api.routes`.
         
@@ -71,7 +71,7 @@ class ExecutionGraph:
         persisted_history = []
         if session_id:
             try:
-                persisted_history = get_chat_history(session_id)
+                persisted_history = get_chat_history(session_id, tenant_id=tenant_id)
             except Exception:
                 persisted_history = []
 
@@ -85,7 +85,7 @@ class ExecutionGraph:
             "tenant_id": tenant_id,
             "query": query,
             "chat_history": safe_history,
-            "streaming_callback": None,
+            "streaming_callback": streaming_callback,
             "intent": None,
             "search_query": None,
             "context_chunks": [],
@@ -112,7 +112,7 @@ class ExecutionGraph:
         # Persist the user turn immediately
         if session_id:
             try:
-                save_chat_turn(session_id, "user", query)
+                save_chat_turn(session_id, "user", query, tenant_id=tenant_id)
             except Exception:
                 pass
 
@@ -147,7 +147,7 @@ class ExecutionGraph:
                     state["chat_history"].append({"role": "assistant", "content": state["answer"]})
                     if session_id:
                         try:
-                            save_chat_turn(session_id, "assistant", state["answer"])
+                            save_chat_turn(session_id, "assistant", state["answer"], tenant_id=tenant_id)
                         except Exception:
                             pass
                     return state
@@ -159,7 +159,7 @@ class ExecutionGraph:
                 state["chat_history"].append({"role": "assistant", "content": state["answer"]})
                 if session_id:
                     try:
-                        save_chat_turn(session_id, "assistant", state["answer"])
+                        save_chat_turn(session_id, "assistant", state["answer"], tenant_id=tenant_id)
                     except Exception:
                         pass
                 return state
@@ -221,7 +221,7 @@ class ExecutionGraph:
             state["chat_history"].append({"role": "assistant", "content": state["answer"]})
             if session_id:
                 try:
-                    save_chat_turn(session_id, "assistant", state["answer"])
+                    save_chat_turn(session_id, "assistant", state["answer"], tenant_id=tenant_id)
                 except Exception:
                     pass
             return state
@@ -234,7 +234,7 @@ class ExecutionGraph:
              final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
              if session_id:
                  try:
-                     save_chat_turn(session_id, "assistant", final_state.get("answer", ""))
+                     save_chat_turn(session_id, "assistant", final_state.get("answer", ""), tenant_id=tenant_id)
                  except Exception:
                      pass
              return final_state
@@ -252,7 +252,7 @@ class ExecutionGraph:
              final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
              if session_id:
                  try:
-                     save_chat_turn(session_id, "assistant", final_state.get("answer", ""))
+                     save_chat_turn(session_id, "assistant", final_state.get("answer", ""), tenant_id=tenant_id)
                  except Exception:
                      pass
              return final_state
@@ -268,7 +268,7 @@ class ExecutionGraph:
              final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
              if session_id:
                  try:
-                     save_chat_turn(session_id, "assistant", final_state.get("answer", ""))
+                     save_chat_turn(session_id, "assistant", final_state.get("answer", ""), tenant_id=tenant_id)
                  except Exception:
                      pass
              return final_state
@@ -280,7 +280,7 @@ class ExecutionGraph:
         state["chat_history"].append({"role": "assistant", "content": state["answer"]})
         if session_id:
             try:
-                save_chat_turn(session_id, "assistant", state["answer"])
+                save_chat_turn(session_id, "assistant", state["answer"], tenant_id=tenant_id)
             except Exception:
                 pass
         return state

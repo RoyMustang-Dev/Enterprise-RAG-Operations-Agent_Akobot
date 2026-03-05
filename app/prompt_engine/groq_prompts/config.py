@@ -126,14 +126,32 @@ Brand Details: {short_brand}
 
     # 3. Assemble Few-Shots
     # We dynamically load real-world JSON arrays researched per-model.
+    # Explicitly skip few-shots for non-Groq providers (modelslab/gemini) to
+    # keep advanced CoT/ToT/ReAct prompts clean and consistent with provider guidelines.
     few_shots_block = ""
-    few_shots_path = os.path.join(
-        os.path.dirname(__file__), 
-        "few_shots", 
-        f"{stage}_{model.replace('/', '_').replace('-', '_')}.json"
-    )
-    
-    if os.path.exists(few_shots_path):
+    skip_few_shots = False
+    try:
+        from app.infra.model_registry import PHASE_MODELS
+        phase_cfg = PHASE_MODELS.get(stage, {})
+        if phase_cfg.get("provider") in ("modelslab", "gemini"):
+            skip_few_shots = True
+    except Exception:
+        pass
+    # If paid providers are present, disable few-shots globally to avoid drift.
+    if os.getenv("MODELSLAB_API_KEY") or os.getenv("GEMINI_API_KEY"):
+        skip_few_shots = True
+
+    model_key = (model or "").lower()
+    if skip_few_shots or model_key.startswith("modelslab/") or model_key.startswith("gemini/"):
+        few_shots_path = None
+    else:
+        few_shots_path = os.path.join(
+            os.path.dirname(__file__),
+            "few_shots",
+            f"{stage}_{model.replace('/', '_').replace('-', '_')}.json"
+        )
+
+    if few_shots_path and os.path.exists(few_shots_path):
         try:
             with open(few_shots_path, "r", encoding="utf-8") as f:
                 examples = json.load(f)

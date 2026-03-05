@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.core.telemetry import ObservabilityLayer
 from app.core.rate_limit import TokenBucketRateLimiter
-from app.infra.database import init_ingestion_db, get_ingestion_job
+from app.infra.database import init_ingestion_db, get_ingestion_job, set_current_tenant
 from app.infra.job_tracker import JobTracker
 from app.infra.hardware import HardwareProbe
 from app.core.types import TelemetryLogRecord
@@ -38,6 +38,14 @@ _rate_limiter = TokenBucketRateLimiter()
 router = APIRouter()
 logger = logging.getLogger(__name__)
 telemetry = ObservabilityLayer()
+_MODELSLAB_KEY = os.getenv("MODELSLAB_API_KEY", "")
+
+def _mask_secret(text: str) -> str:
+    if not text:
+        return text
+    if _MODELSLAB_KEY and _MODELSLAB_KEY in text:
+        return text.replace(_MODELSLAB_KEY, "[REDACTED]")
+    return text
 
 # -----------------------------------------------------------------------------
 # Global Bootstrapper (Create New Agent)
@@ -137,15 +145,15 @@ def _chunk_text_for_stream(text: str, size: int = 120):
 # -----------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     query: str = Field(..., description="The user's raw prompt.")
-    model_provider: Literal["groq", "openai", "anthropic", "gemini", "auto"] = Field(
+    model_provider: Literal["groq", "openai", "anthropic", "gemini", "modelslab", "auto"] = Field(
         default="auto",
-        description="Requested provider. Use 'auto' to let the system choose the best available provider.",
+        description="Requested provider. Use 'auto' to prefer Modelslab/Gemini when keys are present, with Groq fallback.",
     )
     session_id: Optional[str] = Field(default=None, description="Optional client session identifier for telemetry correlation.")
     stream: Optional[bool] = Field(default=False, description="Enable server-sent events (SSE) streaming output.")
     reranker_model_name: Optional[str] = Field(
-        default="llama-3.1-8b-instant",
-        description="LLM-as-a-Judge reranker model."
+        default=None,
+        description="LLM-as-a-Judge reranker model. If omitted, uses provider defaults."
     )
 
     model_config = {
@@ -280,7 +288,7 @@ class FeedbackRequest(BaseModel):
                             "query": {"type": "string"},
                             "model_provider": {
                                 "type": "string",
-                                "enum": ["groq", "openai", "anthropic", "gemini", "auto"],
+                                "enum": ["groq", "openai", "anthropic", "gemini", "modelslab", "auto"],
                                 "default": "auto",
                                 "description": "Provider selection. Use auto to let the system choose the best available provider."
                             },
@@ -331,6 +339,7 @@ async def chat_endpoint(
     - `x-tenant-id`: tenant or collection namespace
     - `x-user-id`: user identity for telemetry
     """
+    set_current_tenant(x_tenant_id)
     chat_history_list = []
     files: List[UploadFile] = []
     image_files: List[UploadFile] = []
@@ -400,7 +409,7 @@ async def chat_endpoint(
 
     # chat_history is auto-managed server-side via session history; client input is ignored
 
-    model_provider = (model_provider or "groq").lower()
+    model_provider = (model_provider or "auto").lower()
     session_id = session_id or str(uuid.uuid4())
     image_mode = image_mode or "auto"
     reranker_model_name = reranker_model_name or None
@@ -439,6 +448,41 @@ async def chat_endpoint(
             if ext not in allowed_img_exts:
                 raise HTTPException(status_code=415, detail=f"Unsupported image type: {img.filename}")
 
+        # If images are provided and user asks about image, short-circuit BEFORE ingestion.
+        image_keywords = ["image", "photo", "picture", "screenshot", "describe", "what's in the image", "what is in the image"]
+        q_lower = (query or "").lower()
+        image_only = bool(image_files) and not files and (image_mode in ["vision", "ocr"] or any(k in q_lower for k in image_keywords))
+        if image_only:
+            max_mb = int(os.getenv("MAX_UPLOAD_MB", "20"))
+            for f in image_files:
+                file_bytes = await f.read()
+                if len(file_bytes) > max_mb * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail=f"File too large. Max allowed: {max_mb} MB.")
+                image_payloads.append((f.filename, file_bytes))
+            response = router.answer_images(
+                question=query,
+                image_files=image_payloads,
+                session_id=session_id,
+                image_mode=image_mode,
+            )
+            logger.info("[MULTIMODAL] Short-circuiting RAG for vision-only query.")
+            if stream:
+                async def event_gen():
+                    for chunk in _chunk_text_for_stream(response.get("answer", "")):
+                        yield f"data: {chunk}\n\n"
+                    meta = {
+                        "session_id": response.get("session_id"),
+                        "sources": response.get("sources", []),
+                        "confidence": response.get("confidence", 0.0),
+                        "verifier_verdict": response.get("verifier_verdict", "UNVERIFIED"),
+                        "is_hallucinated": response.get("is_hallucinated", False),
+                        "optimizations": response.get("optimizations", {}),
+                        "latency_optimizations": response.get("latency_optimizations", {}),
+                    }
+                    yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+                return StreamingResponse(event_gen(), media_type="text/event-stream")
+            return response
+
         # If files were uploaded, ingest and attach ephemeral session collection
         if files or image_files:
             max_mb = int(os.getenv("MAX_UPLOAD_MB", "20"))
@@ -457,6 +501,7 @@ async def chat_endpoint(
                 files=file_payloads,
                 session_id=session_id,
                 image_mode=image_mode,
+                tenant_id=x_tenant_id,
             )
             extra_collections = [ingest_info["collection_name"]]
             logger.info(
@@ -468,8 +513,6 @@ async def chat_endpoint(
                 raise HTTPException(status_code=400, detail="Uploaded files/images produced no extractable content.")
 
         # If images are provided and user asks about image, route directly to vision/OCR response.
-        image_keywords = ["image", "photo", "picture", "screenshot", "describe", "what's in the image", "what is in the image"]
-        q_lower = (query or "").lower()
         if image_files and (image_mode in ["vision", "ocr"] or any(k in q_lower for k in image_keywords)):
             if not image_payloads:
                 for f in image_files:
@@ -481,6 +524,25 @@ async def chat_endpoint(
                 session_id=session_id,
                 image_mode=image_mode,
             )
+            # If user explicitly asked about the image, return immediately (skip RAG pipeline).
+            if image_mode in ["vision", "ocr"] or any(k in q_lower for k in image_keywords):
+                logger.info("[MULTIMODAL] Short-circuiting RAG for vision-only query.")
+                if stream:
+                    async def event_gen():
+                        for chunk in _chunk_text_for_stream(response.get("answer", "")):
+                            yield f"data: {chunk}\n\n"
+                        meta = {
+                            "session_id": response.get("session_id"),
+                            "sources": response.get("sources", []),
+                            "confidence": response.get("confidence", 0.0),
+                            "verifier_verdict": response.get("verifier_verdict", "UNVERIFIED"),
+                            "is_hallucinated": response.get("is_hallucinated", False),
+                            "optimizations": response.get("optimizations", {}),
+                            "latency_optimizations": response.get("latency_optimizations", {}),
+                        }
+                        yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+                    return StreamingResponse(event_gen(), media_type="text/event-stream")
+                return response
             if stream:
                 async def event_gen():
                     for chunk in _chunk_text_for_stream(response.get("answer", "")):
@@ -501,7 +563,7 @@ async def chat_endpoint(
             # No files this turn; reuse prior session collection if available
             if session_id:
                 try:
-                    collection_name = router.session_vectors.get_session_collection(session_id)
+                    collection_name = router.session_vectors.get_session_collection(session_id, tenant_id=x_tenant_id)
                     if collection_name:
                         extra_collections = [collection_name]
                         file_keywords = [
@@ -522,6 +584,109 @@ async def chat_endpoint(
         # If files/images are present, we route through multimodal flows above.
 
         orchestrator = _get_orchestrator()
+
+        if stream:
+            # Provider-native streaming path
+            import asyncio
+            token_queue: asyncio.Queue[str] = asyncio.Queue()
+            done_event = asyncio.Event()
+            result_holder: Dict[str, Any] = {}
+            streamed_any = {"value": False}
+
+            def _on_token(tok: str):
+                if tok:
+                    streamed_any["value"] = True
+                    try:
+                        token_queue.put_nowait(tok)
+                    except Exception:
+                        pass
+
+            async def _run_orchestrator():
+                try:
+                    result = await orchestrator.invoke(
+                        query,
+                        chat_history_list,
+                        session_id=session_id,
+                        tenant_id=x_tenant_id,
+                        model_provider=model_provider,
+                        extra_collections=extra_collections,
+                        reranker_profile=reranker_profile,
+                        reranker_model_name=reranker_model_name,
+                        force_session_context=force_session_context,
+                        streaming_callback=_on_token,
+                    )
+                    result_holder["result"] = result
+                    elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+                    try:
+                        telemetry.emit(
+                            TelemetryLogRecord(
+                                timestamp=ObservabilityLayer.get_timestamp(),
+                                session_id=session_id,
+                                user_id=x_user_id or "anonymous_user",
+                                query=query,
+                                intent_detected=(result.get("intent") or "unknown"),
+                                routed_agent=result.get("optimizations", {}).get("agent_routed", "unknown"),
+                                latency_ms=elapsed_ms,
+                                llm_time_ms=float(result.get("latency_optimizations", {}).get("llm_time_ms", 0.0)),
+                                retrieval_time_ms=float(result.get("latency_optimizations", {}).get("retrieval_time_ms", 0.0)),
+                                rerank_time_ms=float(result.get("latency_optimizations", {}).get("rerank_time_ms", 0.0)),
+                                verifier_score=float(result.get("confidence", 0.0)),
+                                hallucination_score=bool(result.get("is_hallucinated", False)),
+                                hardware_used="gpu" if HardwareProbe.detect_environment().get("primary_device") in ["cuda", "mps"] else "cpu",
+                                complexity_score=float(result.get("optimizations", {}).get("complexity_score", 0.0)),
+                                metadata_filters_applied=result.get("optimizations", {}).get("metadata_filters", {}),
+                                reward_score=float(result.get("optimizations", {}).get("reward_score", 0.0)),
+                                tokens_input=int(result.get("optimizations", {}).get("tokens_input", 0) or 0),
+                                tokens_output=int(result.get("optimizations", {}).get("tokens_output", 0) or 0),
+                                temperature_used=float(result.get("optimizations", {}).get("temperature_used", 0.0) or 0.0),
+                                answer_preview=(result.get("answer", "") or "")[:500],
+                                model_provider=result.get("optimizations", {}).get("model_provider"),
+                                model_selected=result.get("latency_optimizations", {}).get("model_selected"),
+                                reranker_model_name=result.get("optimizations", {}).get("reranker_model_name"),
+                                retrieval_scope=result.get("optimizations", {}).get("retrieval_scope"),
+                                active_persona=result.get("active_persona"),
+                                stream_enabled=True,
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning(f"[TELEMETRY] Failed to emit log record: {e}")
+                except Exception as e:
+                    result_holder["error"] = str(e)
+                finally:
+                    done_event.set()
+
+            asyncio.create_task(_run_orchestrator())
+
+            async def event_gen():
+                while True:
+                    if done_event.is_set() and token_queue.empty():
+                        break
+                    try:
+                        tok = await asyncio.wait_for(token_queue.get(), timeout=0.2)
+                        if tok:
+                            yield f"data: {tok}\n\n"
+                    except asyncio.TimeoutError:
+                        continue
+
+                result = result_holder.get("result") or {}
+                if not streamed_any["value"]:
+                    for chunk in _chunk_text_for_stream(result.get("answer", "")):
+                        yield f"data: {chunk}\n\n"
+
+                meta = {
+                    "session_id": session_id,
+                    "sources": result.get("sources", []),
+                    "confidence": result.get("confidence", 0.0),
+                    "verifier_verdict": result.get("verifier_verdict", "UNVERIFIED"),
+                    "is_hallucinated": result.get("is_hallucinated", False),
+                    "optimizations": result.get("optimizations", {}),
+                    "latency_optimizations": result.get("latency_optimizations", {}),
+                    "active_persona": result.get("active_persona", None),
+                }
+                yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+
+            return StreamingResponse(event_gen(), media_type="text/event-stream")
+
         result = await orchestrator.invoke(
             query,
             chat_history_list,
@@ -571,27 +736,16 @@ async def chat_endpoint(
                     tokens_output=int(result.get("optimizations", {}).get("tokens_output", 0) or 0),
                     temperature_used=float(result.get("optimizations", {}).get("temperature_used", 0.0) or 0.0),
                     answer_preview=(result.get("answer", "") or "")[:500],
+                    model_provider=result.get("optimizations", {}).get("model_provider"),
+                    model_selected=result.get("latency_optimizations", {}).get("model_selected"),
+                    reranker_model_name=result.get("optimizations", {}).get("reranker_model_name"),
+                    retrieval_scope=result.get("optimizations", {}).get("retrieval_scope"),
+                    active_persona=result.get("active_persona"),
+                    stream_enabled=False,
                 )
             )
         except Exception as e:
             logger.warning(f"[TELEMETRY] Failed to emit log record: {e}")
-
-        if stream:
-            async def event_gen():
-                for chunk in _chunk_text_for_stream(response.answer):
-                    yield f"data: {chunk}\n\n"
-                meta = {
-                    "session_id": response.session_id,
-                    "sources": response.sources,
-                    "confidence": response.confidence,
-                    "verifier_verdict": response.verifier_verdict,
-                    "is_hallucinated": response.is_hallucinated,
-                    "optimizations": response.optimizations,
-                    "latency_optimizations": response.latency_optimizations,
-                }
-                yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
-
-            return StreamingResponse(event_gen(), media_type="text/event-stream")
 
         return response
     except HTTPException:
@@ -599,6 +753,8 @@ async def chat_endpoint(
     except Exception as e:
         import traceback; logger.error(f"Chat Execution Failed: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal Generation Error.")
+    finally:
+        set_current_tenant(None)
 
 
 # -----------------------------------------------------------------------------
@@ -740,7 +896,7 @@ def _run_crawler_background(url, max_depth, save_folder, mode, job_id, tenant_id
         from app.ingestion.crawler_service import CrawlerService
         from app.ingestion.pipeline import IngestionPipeline
 
-        crawler = CrawlerService()
+        crawler = CrawlerService(tenant_id=tenant_id)
         pipeline = IngestionPipeline(tenant_id=tenant_id)
         reset_db = mode == "overwrite"
         is_first_batch = [True]
@@ -750,6 +906,44 @@ def _run_crawler_background(url, max_depth, save_folder, mode, job_id, tenant_id
             ingestion_jobs[job_id]["status"] = "crawling_and_extracting"
 
             import hashlib
+
+            def _infer_page_type(url: str) -> str:
+                path = (urlparse(url).path or "").lower()
+                if "/product" in path:
+                    return "product"
+                if "/pricing" in path:
+                    return "pricing"
+                if "/docs" in path or "/documentation" in path:
+                    return "docs"
+                if "/blog" in path:
+                    return "blog"
+                if "/help" in path or "/support" in path:
+                    return "support"
+                if "/category" in path or "/listing" in path:
+                    return "listing"
+                return "general"
+
+            def _quality_score(text: str) -> float:
+                if not text:
+                    return 0.0
+                words = [w for w in text.split() if w]
+                wc = len(words)
+                if wc == 0:
+                    return 0.0
+                unique_ratio = len(set(words)) / max(1, wc)
+                length_score = min(1.0, wc / 200)
+                return round((0.6 * length_score) + (0.4 * unique_ratio), 3)
+
+            def _is_thin(text: str) -> bool:
+                if not text:
+                    return True
+                wc = len(text.split())
+                if wc < 40:
+                    return True
+                lowered = text.lower()
+                if wc < 80 and ("cookie" in lowered and "policy" in lowered):
+                    return True
+                return False
 
             paths = []
             metas = []
@@ -761,6 +955,9 @@ def _run_crawler_background(url, max_depth, save_folder, mode, job_id, tenant_id
                 current_url = item[1]
                 title = item[2]
                 content = item[3]
+                if _is_thin(content):
+                    continue
+                quality = _quality_score(content)
 
                 safe_name = hashlib.md5(current_url.encode()).hexdigest()
                 path = os.path.join(domain_folder, safe_name + ".txt")
@@ -775,6 +972,8 @@ def _run_crawler_background(url, max_depth, save_folder, mode, job_id, tenant_id
                         "source_url": current_url,
                         "source_domain": urlparse(current_url).netloc,
                         "document_type": "webpage",
+                        "page_type": _infer_page_type(current_url),
+                        "quality_score": quality,
                     }
                 )
 
@@ -937,8 +1136,8 @@ async def ingestion_status_endpoint(x_tenant_id: Optional[str] = Header(default=
 @router.post(
     "/tts",
     tags=["Audio"],
-    summary="Text-to-Speech (Coqui)",
-    description="Generate a WAV audio response from input text using Coqui TTS. "
+    summary="Text-to-Speech (Modelslab)",
+    description="Generate a speech audio response from input text using ModelsLab TTS. "
                 "Accepts JSON ({\"text\": \"...\"}) or form-data (text=...).",
     openapi_extra={
         "requestBody": {
@@ -963,14 +1162,120 @@ async def tts_endpoint(
     payload: Optional[TTSRequest] = Body(default=None),
     text: Optional[str] = Form(default=None, description="Text to synthesize into speech.")
 ):
-    """Generate a WAV file from text using local Coqui TTS."""
+    """Generate a speech audio response from text using ModelsLab (fallback to local Coqui if key missing)."""
     try:
         if payload is not None:
             text = payload.text
         if not text:
             raise HTTPException(status_code=422, detail="Missing required field: text")
-        from app.multimodal.tts import TextToSpeech
 
+        modelslab_key = os.getenv("MODELSLAB_API_KEY")
+        if modelslab_key:
+            import aiohttp
+            import tempfile
+
+            voice_id = "mia"
+            language = "american english"
+            
+            # Simple Hindi character detection
+            if any("\u0900" <= c <= "\u097F" for c in text):
+                voice_id = "tara"
+                language = "hindi"
+
+            import asyncio
+            import re
+
+            # Chunk text to avoid timeouts and limits. Max ~450 chars per chunk.
+            def _chunk_text(t: str, max_len=450) -> list[str]:
+                chunks = []
+                sentences = re.split(r'(?<=[.!?]) +', t)
+                curr = ""
+                for s in sentences:
+                    if len(curr) + len(s) < max_len:
+                        curr += s + " "
+                    else:
+                        if curr.strip(): chunks.append(curr.strip())
+                        curr = s + " "
+                if curr.strip(): chunks.append(curr.strip())
+                return chunks or [t[:max_len]]
+
+            text_chunks = _chunk_text(text)
+
+            async def _fetch_chunk(session, c_text: str):
+                payload = {
+                    "key": modelslab_key,
+                    "prompt": c_text,
+                    "language": language,
+                    "voice_id": voice_id,
+                    "speed": "0.8",
+                    "emotion": True,
+                }
+                async with session.post(
+                    "https://modelslab.com/api/v6/voice/text_to_speech",
+                    json=payload,
+                    timeout=60,
+                ) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+                    if result.get("status") == "error":
+                        raise HTTPException(status_code=502, detail=_mask_secret(f"ModelsLab TTS Error: {result.get('message', result)}"))
+
+                audio_url = None
+                for k in ("output", "proxy_links", "future_links", "links"):
+                    if isinstance(result.get(k), list) and result[k]:
+                        audio_url = result[k][0]
+                        break
+                    if isinstance(result.get(k), dict):
+                        for dk in ("audio_url", "url", "link"):
+                            if result[k].get(dk):
+                                audio_url = result[k].get(dk)
+                                break
+                if not audio_url and isinstance(result.get("audio_url"), str):
+                    audio_url = result.get("audio_url")
+                if not audio_url and isinstance(result.get("audio"), str):
+                    audio_url = result.get("audio")
+                if not audio_url and isinstance(result.get("fetch_result"), str):
+                    audio_url = result.get("fetch_result")
+                if not audio_url:
+                    raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab TTS did not return an audio URL. Raw: {result}"))
+
+                # Some URLs are not immediately ready; retry on 404/5xx.
+                backoff = 3
+                last_err = None
+                for attempt in range(12):
+                    try:
+                        async with session.get(audio_url, timeout=60) as audio_resp:
+                            if audio_resp.status == 404:
+                                last_err = f"404 for {audio_url}"
+                                await asyncio.sleep(backoff)
+                                backoff = min(backoff * 1.5, 12)
+                                continue
+                            audio_resp.raise_for_status()
+                            return await audio_resp.read(), audio_url
+                    except Exception as e:
+                        last_err = str(e)
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 1.5, 12)
+                raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab TTS audio fetch failed: {last_err}"))
+
+            async with aiohttp.ClientSession() as session:
+                tasks = [_fetch_chunk(session, c) for c in text_chunks]
+                results = await asyncio.gather(*tasks)
+
+            combined_audio_bytes = b""
+            suffix = ".mp3"
+            for audio_bytes, a_url in results:
+                combined_audio_bytes += audio_bytes
+                if a_url.endswith(".wav"): suffix = ".wav"
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(combined_audio_bytes)
+            tmp.close()
+            media_type = "audio/mpeg" if suffix == ".mp3" else "audio/wav"
+            return FileResponse(tmp.name, media_type=media_type, filename=f"speech{suffix}")
+
+        # Fallback to local Coqui if ModelsLab key is missing
+        from app.multimodal.tts import TextToSpeech
         engine = TextToSpeech()
         audio_path = engine.generate_audio(text)
         return FileResponse(audio_path, media_type="audio/wav", filename="speech.wav")
@@ -996,14 +1301,14 @@ class TranscriptionResponse(BaseModel):
     "/transcribe",
     response_model=TranscriptionResponse,
     tags=["Audio"],
-    summary="Audio Transcription (Experimental)",
-    description="Audio transcription endpoint. Accepts WAV/MP3 files and returns text."
+    summary="Audio Transcription (Modelslab)",
+    description="Audio transcription endpoint using ModelsLab STT. Accepts WAV/MP3 files and returns text."
 )
 async def transcribe_audio_endpoint(
     http_request: Request,
     audio_file: UploadFile = File(..., description="WAV or MP3 audio stream")
 ):
-    """Audio transcription via Groq Whisper or local Whisper pipeline."""
+    """Audio transcription via ModelsLab STT (fallback to local Whisper if key missing)."""
     try:
         client_id = http_request.client.host if http_request.client else "anonymous"
         _rate_limiter.consume(client_id)
@@ -1015,11 +1320,124 @@ async def transcribe_audio_endpoint(
         if ext not in [".wav", ".mp3"]:
             raise HTTPException(status_code=415, detail="Unsupported file type. Please upload WAV or MP3.")
 
-        backend = os.getenv("STT_BACKEND", "groq").lower()
+        file_bytes = await audio_file.read()
+        modelslab_key = os.getenv("MODELSLAB_API_KEY")
+        if modelslab_key:
+            import aiohttp
+            import base64
+            import asyncio
+
+            # 1) Upload audio as base64 to get a URL
+            mime = "audio/wav" if ext == ".wav" else "audio/mpeg"
+            b64 = base64.b64encode(file_bytes).decode("utf-8")
+            init_audio = f"data:{mime};base64,{b64}"
+            upload_payload = {"key": modelslab_key, "init_audio": init_audio}
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://modelslab.com/api/v6/voice/base64_to_url",
+                    json=upload_payload,
+                    timeout=60,
+                ) as resp:
+                    resp.raise_for_status()
+                    upload_result = await resp.json()
+                    if upload_result.get("status") == "error":
+                        raise HTTPException(status_code=502, detail=_mask_secret(f"ModelsLab STT Upload Error: {upload_result.get('message', upload_result)}"))
+
+            audio_url = None
+            if isinstance(upload_result.get("output"), list) and upload_result["output"]:
+                audio_url = upload_result["output"][0]
+            if not audio_url and isinstance(upload_result.get("audio_url"), str):
+                audio_url = upload_result.get("audio_url")
+            if not audio_url and isinstance(upload_result.get("fetch_result"), str):
+                audio_url = upload_result.get("fetch_result")
+            if not audio_url:
+                raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT upload failed. Raw: {upload_result}"))
+
+            # 2) Request STT (v6 community endpoint)
+            stt_payload = {
+                "key": modelslab_key,
+                "init_audio": audio_url,
+                "language": "en",
+                "timestamp_level": None,
+                "webhook": None,
+                "track_id": None,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://modelslab.com/api/v6/voice/speech_to_text",
+                    json=stt_payload,
+                    timeout=120,
+                ) as resp:
+                    resp.raise_for_status()
+                    stt_result = await resp.json()
+                    if stt_result.get("status") == "error":
+                        raise HTTPException(status_code=502, detail=_mask_secret(f"ModelsLab STT Eval Error: {stt_result.get('message', stt_result)}"))
+
+            status = stt_result.get("status")
+            if isinstance(status, str) and status.lower() in ["error", "failed"]:
+                raise HTTPException(
+                    status_code=502,
+                    detail=_mask_secret(f"Modelslab STT error: {stt_result.get('message', stt_result)}"),
+                )
+
+            if status == "processing" or stt_result.get("fetch_result"):
+                fetch_url = stt_result.get("fetch_result")
+                if fetch_url:
+                    backoff = 3
+                    last_err = None
+                    for attempt in range(15):
+                        await asyncio.sleep(backoff)
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.post(fetch_url, json={"key": modelslab_key}, timeout=60) as fresp:
+                                    fresp.raise_for_status()
+                                    stt_result = await fresp.json()
+                            status = stt_result.get("status")
+                            logger.info(f"[STT] fetch_result poll {attempt+1}/15 status={status}")
+                            if isinstance(status, str) and status.lower() in ["error", "failed"]:
+                                raise HTTPException(
+                                    status_code=502,
+                                    detail=_mask_secret(f"Modelslab STT error: {stt_result.get('message', stt_result)}"),
+                                )
+                            if status == "success" or "output" in stt_result or "text" in stt_result:
+                                break
+                        except Exception as fe:
+                            last_err = fe
+                            logger.warning(f"[STT] fetch_result retry failed: {fe}")
+                        backoff = min(backoff * 1.5, 15)
+                    if status != "success" and not stt_result.get("output") and not stt_result.get("text"):
+                        raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT fetch failed: {last_err or 'Timeout'}"))
+
+            transcript = None
+            if isinstance(stt_result.get("output"), list) and stt_result["output"]:
+                out_val = stt_result["output"][0]
+                if isinstance(out_val, str) and out_val.startswith("http"):
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(out_val, timeout=30) as txt_resp:
+                                txt_resp.raise_for_status()
+                                transcript = await txt_resp.text()
+                    except Exception as e:
+                        logger.warning(f"Failed to download STT text from {out_val}: {e}")
+                else:
+                    transcript = out_val
+            if not transcript and isinstance(stt_result.get("output"), str):
+                transcript = stt_result["output"]
+
+            if not transcript and isinstance(stt_result.get("text"), str):
+                transcript = stt_result["text"]
+            
+            if not transcript:
+                raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT did not return transcript. Raw: {stt_result}"))
+
+            return TranscriptionResponse(transcript=transcript)
+
+        # Fallback to local Whisper if ModelsLab key is missing
+        backend = os.getenv("STT_BACKEND", "local").lower()
         if backend == "local":
             from app.multimodal.stt import SpeechToText
             engine = SpeechToText()
-            file_bytes = await audio_file.read()
             transcript = engine.transcribe(file_bytes, filename=filename)
             return TranscriptionResponse(transcript=transcript)
 
@@ -1077,3 +1495,40 @@ async def rlhf_feedback_endpoint(request: FeedbackRequest):
     except Exception as e:
         logger.error(f"Failed to record RLHF telemetry: {str(e)}")
         return {"status": "error", "message": "Feedback dropped."}
+
+# -----------------------------------------------------------------------------
+# 8. System Metrics Endpoint
+# -----------------------------------------------------------------------------
+class SystemMetricsResponse(BaseModel):
+    cpu_usage_percent: float
+    memory_usage_percent: float
+    tenant_id: str
+    active_jobs: int
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "cpu_usage_percent": 15.4,
+                "memory_usage_percent": 42.1,
+                "tenant_id": "default",
+                "active_jobs": 2
+            }
+        }
+    }
+
+@router.get(
+    "/metrics",
+    response_model=SystemMetricsResponse,
+    tags=["System"],
+    summary="System Metrics Diagnostics",
+    description="Returns hardware diagnostic metrics and active queue states for scaling telemetry."
+)
+async def system_metrics_endpoint(x_tenant_id: Optional[str] = Header(default="default", alias="x-tenant-id")):
+    import psutil
+    active = len([j for j in ingestion_jobs.values() if j._state.get("status") in ["pending", "crawling_and_extracting", "running", "extracting"]])
+    return SystemMetricsResponse(
+        cpu_usage_percent=psutil.cpu_percent(interval=0.1),
+        memory_usage_percent=psutil.virtual_memory().percent,
+        tenant_id=x_tenant_id,
+        active_jobs=active
+    )

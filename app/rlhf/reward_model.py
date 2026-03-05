@@ -7,7 +7,8 @@ import logging
 from typing import Dict, Any, List
 from tenacity import retry, wait_exponential, stop_after_attempt
 import asyncio
-import aiohttp
+from app.infra.llm_client import achat_completion
+from app.infra.model_registry import get_phase_model
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +20,14 @@ class OnlineRewardModel:
     physically retrained 70B variant. It evaluates multiple candidate responses (e.g. standard vs deep reasoning) 
     and mathematically selects the superior output based strictly on Enterprise grounding metrics.
     """
-    def __init__(self, model_id: str = "llama-3.1-8b-instant"):
-        self.model_id = model_id
-        
-        self.api_key = os.getenv("GROQ_API_KEY") 
-        if not self.api_key:
-            logger.warning("[SECURITY] GROQ_API_KEY not found. RLAIF Online Reward offline.")
+    def __init__(self, model_id: str = None):
+        phase = get_phase_model("reward_scorer")
+        self.provider = phase["provider"]
+        self.model_id = model_id or phase["model"]
+        self.temperature = phase.get("temperature", 0.0)
+        self.max_tokens = phase.get("max_tokens", 200)
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
+            logger.warning("[SECURITY] No API key found. RLAIF Online Reward offline.")
             
         from app.prompt_engine.groq_prompts.config import get_compiled_prompt
         self.system_prompt = get_compiled_prompt("reward_scorer", self.model_id)
@@ -41,7 +44,7 @@ class OnlineRewardModel:
         Asynchronously invokes the Reward Model to evaluate two distinct LLM syntagm chains.
         Returns the raw string of the winning candidate natively.
         """
-        if not self.api_key:
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
             return candidate_a # Failsafe defaults to Standard execution
 
         logger.info(f"[RLAIF] Evaluating A/B Candidate Responses natively via {self.model_id}...")
@@ -61,42 +64,29 @@ PHYSICAL CONTEXT:
 {candidate_b}
 """
         
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": self.model_id,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_payload}
-            ],
-            "temperature": 0.0, 
-            "response_format": {"type": "json_object"}
-        }
-
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=10
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    
-                    json_str = data["choices"][0]["message"]["content"]
-                    try:
-                        result = json.loads(json_str)
-                        if result.get("winner") == "B":
-                            logger.info(f"[RLAIF] Selected Candidate B (Score: {result.get('candidate_b_score')}) over A.")
-                            return candidate_b
-                        else:
-                            return candidate_a
-                    except json.JSONDecodeError:
-                        return candidate_a
+            data = await achat_completion(
+                provider=self.provider,
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_payload},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+                timeout=10,
+            )
+            json_str = data["choices"][0]["message"]["content"]
+            try:
+                result = json.loads(json_str)
+                if result.get("winner") == "B":
+                    logger.info(f"[RLAIF] Selected Candidate B (Score: {result.get('candidate_b_score')}) over A.")
+                    return candidate_b
+                else:
+                    return candidate_a
+            except json.JSONDecodeError:
+                return candidate_a
 
         except Exception as e:
             logger.error(f"[RLAIF] Evaluation Fault: {e}")
@@ -112,7 +102,7 @@ PHYSICAL CONTEXT:
         Returns a weighted reward score:
         Grounding (0.4), Actionability (0.3), Conciseness (0.2), Coherence (0.1)
         """
-        if not self.api_key:
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
             return 0.0
 
         system_prompt = """SYSTEM: You are a deterministic response grader.
@@ -136,42 +126,34 @@ RESPONSE:
 {response}
 """
 
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": self.model_id,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_payload},
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-        }
-
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=10,
-                ) as response_obj:
-                    response_obj.raise_for_status()
-                    data = await response_obj.json()
-                    json_str = data["choices"][0]["message"]["content"]
-                    result = json.loads(json_str)
+            data = await achat_completion(
+                provider=self.provider,
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_payload},
+                ],
+                temperature=0.0,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+                timeout=10,
+            )
+            json_str = data["choices"][0]["message"]["content"]
+            result = json.loads(json_str)
 
-                    grounding = float(result.get("grounding", 0.0))
-                    actionability = float(result.get("actionability", 0.0))
-                    conciseness = float(result.get("conciseness", 0.0))
-                    coherence = float(result.get("coherence", 0.0))
+            grounding = float(result.get("grounding", 0.0))
+            actionability = float(result.get("actionability", 0.0))
+            conciseness = float(result.get("conciseness", 0.0))
+            coherence = float(result.get("coherence", 0.0))
 
-                    weighted = (
-                        grounding * 0.4 +
-                        actionability * 0.3 +
-                        conciseness * 0.2 +
-                        coherence * 0.1
-                    )
-                    return max(0.0, min(1.0, weighted))
+            weighted = (
+                grounding * 0.4 +
+                actionability * 0.3 +
+                conciseness * 0.2 +
+                coherence * 0.1
+            )
+            return max(0.0, min(1.0, weighted))
         except Exception as e:
             logger.error(f"[RLAIF] Scoring fault: {e}")
             return 0.0

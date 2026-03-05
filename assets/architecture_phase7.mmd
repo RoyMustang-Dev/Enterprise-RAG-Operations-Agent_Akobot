@@ -13,3 +13,4 @@ graph TD
         UI -.-> |HTTP /api/v1/ingest| IngestAPI[Ingestion Endpoints]:::core
         IngestAPI --> Celery{Celery Task Queue}:::storage
     end
+

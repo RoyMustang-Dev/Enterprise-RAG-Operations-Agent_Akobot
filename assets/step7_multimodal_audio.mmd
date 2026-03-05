@@ -1,5 +1,6 @@
 graph LR
-  A([Input: Voice Audio WAV]) --> B[Coqui TTS / Transcribe]
-  B --> C([Output: Validated NLP Query])
+  A([Input: Voice Audio WAV/MP3]) --> B[ModelsLab STT / TTS<br/>Fallback: Local Whisper/Coqui]
+  B --> C([Output: Transcript or Audio Response])
   style A fill:#e1f5fe,stroke:#0288d1
   style C fill:#fce4ec,stroke:#c2185b
+

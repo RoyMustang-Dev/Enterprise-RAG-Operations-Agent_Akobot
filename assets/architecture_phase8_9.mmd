@@ -9,7 +9,8 @@ graph TD
     subgraph Phase8_9 [Phase 8 & 9: Telemetry, Verification & Qdrant Cloud]
         direction TB
         Qdrant[(Remote Managed Qdrant Cloud)]:::storage --> RAGDAG[Core RAG LangGraph]:::core
-        RAGDAG --> Verifier{Sarvam M<br/>Fact Verifier}:::verify
+        RAGDAG --> Verifier{llama-3.3-70b-versatile-versatile<br/>Fact Verifier}:::verify
         Verifier --> Formatter[Response Formatter + Citation Builder]:::core
         Formatter -.-> TelemetryLog[(Local JSONL Audit Logger)]:::storage
     end
+

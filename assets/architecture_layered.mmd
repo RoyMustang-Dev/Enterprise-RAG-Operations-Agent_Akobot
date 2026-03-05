@@ -11,14 +11,14 @@ graph TD
 
     subgraph Layer1 [Layer 1: Multimodal Ingestion]
         direction TB
-        DocInput([Input: PDF, DOCX, TXT, PNG, JPEG, WAV]) --> DocLoader[PyMuPDF + EasyOCR + Whisper STT]
+        DocInput([Input: PDF, DOCX, TXT, PNG, JPEG, WAV]) --> DocLoader[PyMuPDF + EasyOCR + ModelsLab STT]
         DocLoader_Out([Output: Transcribed Raw Text])
         DocLoader --> DocLoader_Out
     end
 
     subgraph Layer2 [Layer 2: Web Crawler]
         direction TB
-        WebInput([Input: URL Targets]) --> WebCrawler[Playwright Spider]
+        WebInput([Input: URL Targets]) --> WebCrawler["HTTP Crawler + Playwright (SPA) + Sitemap Seed"]
         WebCrawler_Out([Output: Scraped HTML/Text])
         WebCrawler --> WebCrawler_Out
     end
@@ -41,7 +41,7 @@ graph TD
 
     subgraph Layer4 [Layer 4: Security & Triage]
         direction TB
-        L1{Prompt Guard<br/>llama-prompt-guard-2}
+        L1{"Prompt Guard<br/>llama-guard-4-12b"}
         L1_Out([Output: Safe/Malicious Boolean])
         L1 --> L1_Out
     end
@@ -52,13 +52,13 @@ graph TD
     subgraph Layer5 [Layer 5: Expansion & Routing]
         direction TB
         DB[(SQLite Chat History)] -.-> L2
-        L2[Prompt Rewriter<br/>gpt-oss-120b]
+        L2["Prompt Rewriter<br/>llama-3.1-8b-instant"]
         L2_Out([Output: Expanded JSON Queries])
         L2 --> L2_Out
         L2_Out -.-> |"Queries"| Planner{Adaptive Planner}
         Planner_Out([Output: Route & Effort])
         Planner --> Planner_Out
-        Planner_Out -.-> |"Route Execution"| L3{Intent Supervisor<br/>llama-3.1-8b-instant}
+        Planner_Out -.-> |"Route Execution"| L3{"Intent Supervisor<br/>llama-3.1-8b-instant"}
         L3_Out([Output: Intent Enum])
         L3 --> L3_Out
     end
@@ -67,15 +67,15 @@ graph TD
     
     subgraph Layer6 [Layer 6: Grounding & Retrieval]
         direction TB
-        L4[Metadata Extractor<br/>llama-3.1-8b-instant]
+        L4["Metadata Extractor<br/>llama-3.1-8b-instant"]
         L4_Out([Output: JSON Schema Filters])
         L4 --> L4_Out
         
-        L4_Out -.-> |"Filters + Embedding"| L5[(Qdrant Similarity Search<br/>+ BAAI/bge-large-en)]
+        L4_Out -.-> |"Filters + Embedding"| L5[("Qdrant Similarity Search<br/>+ BAAI/bge-large-en")]
         L5_Out([Output: 30 Raw Vector Chunks])
         L5 --> L5_Out
         
-        L5_Out -.-> |"List[Dict]"| L6{Cross-Encoder Reranker<br/>Sigmoid Math Activation}
+        L5_Out -.-> |"List[Dict]"| L6{"LLM Reranker<br/>llama-3.1-8b-instant"}
         L6_Out([Output: Top 5 Validated Chunks])
         L6 --> L6_Out
     end
@@ -86,15 +86,15 @@ graph TD
     
     subgraph Layer7 [Layer 7: Synthesis & Verification]
         direction TB
-        L7{Complexity Analyzer<br/>Heuristic Engine}
+        L7{"Complexity Analyzer<br/>Heuristic Engine"}
         L7_Out([Output: Target Model Route])
         L7 --> L7_Out
         
-        L7_Out -.-> |"Load Balance"| L8[Reasoning API Synthesis<br/>llama-3.3-70b OR gpt-oss-120b]
+        L7_Out -.-> |"Load Balance"| L8["Reasoning API Synthesis<br/>gemini-2.5-flash (ModelsLab)"]
         L8_Out([Output: Draft JSON Payload])
         L8 --> L8_Out
         
-        L8_Out -.-> |"Generated Claims"| L9{Fact Verifier<br/>Sarvam M}
+        L8_Out -.-> |"Generated Claims"| L9{"Fact Verifier<br/>llama-3.3-70b-versatile-versatile"}
         L9_Out([Output: Hallucination Array])
         L9 --> L9_Out
         
@@ -105,10 +105,10 @@ graph TD
     
     subgraph Layer8 [Layer 8: Output & Telemetry]
         direction TB
-        L10[Document Formatter<br/>FastAPI Layer]
+        L10["Document Formatter<br/>FastAPI Layer"]
         L10_Out([Output: HTTP 200 Fast API Response])
         L10 --> L10_Out
-        L11[(audit_logs.jsonl<br/>Telemetry Stream)]
+        L11[("audit_logs.jsonl<br/>Telemetry Stream")]
         L10 -.-> L11
     end
 
@@ -119,3 +119,4 @@ graph TD
     class Embed,L3,L6,L7 core;
     class KB,L5,L11 storage;
     class L8 highlight;
+

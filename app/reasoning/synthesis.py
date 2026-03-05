@@ -15,7 +15,8 @@ load_dotenv(override=True)
 import json
 import logging
 from app.infra.logging_utils import stage_info, stage_warn
-import requests
+from app.infra.llm_client import chat_completion, achat_completion_stream
+from app.infra.model_registry import get_phase_model
 import tiktoken
 from tenacity import retry, wait_exponential, stop_after_attempt
 from typing import Dict, Any, List
@@ -27,9 +28,10 @@ class SynthesisEngine:
     Executes the dense grounding logic utilizing Groq's largest available reasoning model.
     """
     
-    def __init__(self, model_override: str = "llama-3.3-70b-versatile"):
-        self.api_key = os.getenv("GROQ_API_KEY")
-        self.model_id = model_override
+    def __init__(self, model_override: str = None):
+        phase = get_phase_model("rag_synthesis")
+        self.provider = phase["provider"]
+        self.model_id = model_override or phase["model"]
         
         # Tokenizer initialization for boundary limits
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -39,26 +41,28 @@ class SynthesisEngine:
         from app.prompt_engine.groq_prompts.config import get_compiled_prompt
         self.system_prompt = get_compiled_prompt("rag_synthesis", self.model_id)
 
-    @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
-    def _execute_api_call(self, headers: dict, payload: dict) -> requests.Response:
+    @retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(2))
+    def _execute_api_call(self, payload: dict) -> dict:
         """Executes the POST HTTP layer securely guarded by an exponential backoff decorator."""
         stage_info(logger, "RAG:SYNTH", "api_call")
-        # 30 second timeout as 8K token context evaluation requires heavy vRAM latency on Groq's backend
-        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
-        
-        if response.status_code != 200:
-            logger.error(f"[SYNTHESIS API ERROR] {response.text}")
-            
-        response.raise_for_status()
-        return response
+        # 20 second timeout to avoid excessive tail latency on large models
+        return chat_completion(
+            provider=self.provider,
+            model=payload["model"],
+            messages=payload["messages"],
+            temperature=payload.get("temperature", 0.3),
+            max_tokens=payload.get("max_tokens"),
+            response_format=payload.get("response_format"),
+            timeout=20,
+        )
 
     def synthesize(self, user_prompt: str, context_chunks: List[Dict[str, Any]],
                    override_model: str = None, override_temp: float = None) -> Dict[str, Any]:
         """
         Synthesizes the final conversational output while structurally balancing token economics.
         """
-        if not self.api_key:
-             return {"answer": "Error: Groq API Key missing.", "provenance": [], "confidence": 0.0}
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
+             return {"answer": "Error: API Key missing.", "provenance": [], "confidence": 0.0}
              
         # Target Model Assignments via Routing Override
         active_model = override_model if override_model else self.model_id
@@ -93,11 +97,6 @@ class SynthesisEngine:
                 }
             )
             
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
         payload = {
             "model": active_model,
             "messages": [
@@ -105,14 +104,12 @@ class SynthesisEngine:
                 {"role": "user", "content": f"CONTEXT DOCUMENTS:\n{context_string}\n\nUSER_PROMPT: {user_prompt}"}
             ],
             "temperature": active_temp, # Bounded creativity
-            "max_completion_tokens": 2048
+            "max_tokens": 2048
         }
         
         try:
             stage_info(logger, "RAG:SYNTH", "payload_ready")
-            response = self._execute_api_call(headers, payload)
-
-            response_json = response.json()
+            response_json = self._execute_api_call(payload)
             raw_content = response_json["choices"][0]["message"]["content"]
             try:
                 parsed_result = json.loads(raw_content)
@@ -166,3 +163,94 @@ class SynthesisEngine:
                  "temperature_used": active_temp,
                  "model_used": active_model,
              }
+
+    async def synthesize_stream(
+        self,
+        user_prompt: str,
+        context_chunks: List[Dict[str, Any]],
+        override_model: str = None,
+        override_temp: float = None,
+        on_token=None,
+    ) -> Dict[str, Any]:
+        """
+        Provider-native streaming synthesis. Streams tokens via callback while also
+        returning the final aggregated response.
+        """
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+            return {"answer": "Error: API Key missing.", "provenance": [], "confidence": 0.0}
+
+        active_model = override_model if override_model else self.model_id
+        active_temp = override_temp if override_temp is not None else 0.3
+
+        system_overhead = len(self.tokenizer.encode(self.system_prompt))
+        user_prompt_overhead = len(self.tokenizer.encode(user_prompt))
+        budget_remaining = self.MAX_INPUT_TOKENS - (system_overhead + user_prompt_overhead)
+
+        context_string = ""
+        cost_sum = 0
+        provenance = []
+        for i, chunk in enumerate(context_chunks):
+            chunk_text = chunk.get("page_content", "")
+            cost = len(self.tokenizer.encode(chunk_text))
+            if cost_sum + cost > budget_remaining:
+                logger.warning(f"[SYNTHESIS] Truncating remaining chunks to survive Token Budget. Cost hit {cost_sum}/{budget_remaining}")
+                break
+            native_id = str(chunk.get("source", f"Chunk-{i}"))
+            context_string += f"[Doc {native_id}]:\n{chunk_text}\n---\n"
+            cost_sum += cost
+            provenance.append(
+                {
+                    "source": native_id,
+                    "score": chunk.get("score", 0.0),
+                    "text": chunk_text[:240],
+                }
+            )
+
+        payload = {
+            "model": active_model,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"CONTEXT DOCUMENTS:\n{context_string}\n\nUSER_PROMPT: {user_prompt}"}
+            ],
+            "temperature": active_temp,
+            "max_tokens": 2048
+        }
+
+        answer_text = ""
+        try:
+            async for delta in achat_completion_stream(
+                provider=self.provider,
+                model=payload["model"],
+                messages=payload["messages"],
+                temperature=payload.get("temperature", 0.3),
+                max_tokens=payload.get("max_tokens"),
+                response_format=payload.get("response_format"),
+                timeout=30,
+            ):
+                if delta and on_token:
+                    on_token(delta)
+                answer_text += delta
+        except Exception as e:
+            stage_warn(logger, "RAG:SYNTH", f"stream_crash={e}")
+
+        # Parse JSON if possible
+        confidence = 0.0
+        try:
+            parsed_result = json.loads(answer_text)
+            answer_text = parsed_result.get("answer", "")
+            confidence = parsed_result.get("confidence", 0.0)
+        except Exception:
+            pass
+
+        tokens_input = system_overhead + user_prompt_overhead + cost_sum
+        tokens_output = len(self.tokenizer.encode(answer_text)) if answer_text else 0
+
+        return {
+            "answer": answer_text.strip(),
+            "provenance": provenance,
+            "confidence": confidence,
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "temperature_used": active_temp,
+            "model_used": active_model
+        }

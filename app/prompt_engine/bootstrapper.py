@@ -1,14 +1,14 @@
 import os
-import json
 import logging
 import sqlite3
-import requests
-from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
+from app.infra.model_registry import get_phase_model
+from app.infra.llm_client import run_chat_completion
 
 class PersonaBootstrapper:
     """
@@ -17,9 +17,11 @@ class PersonaBootstrapper:
     hyper-detailed ReAct/Tree-of-Thought System Directives using `openai/gpt-oss-120b`.
     """
     def __init__(self):
-        self.api_key = os.getenv("GROQ_API_KEY")
-        # Explicit user mandate: Use gpt-oss-120b provided by Groq to remain API agnostic
-        self.model_id = "openai/gpt-oss-120b"
+        cfg = get_phase_model("bootstrapper")
+        self.provider = cfg["provider"]
+        self.model_id = cfg["model"]
+        self.temperature = cfg.get("temperature", 0.2)
+        self.max_tokens = cfg.get("max_tokens", 1200)
         self.db_path = "data/agent_profiles.db"
         self._initialize_db()
 
@@ -49,11 +51,11 @@ class PersonaBootstrapper:
 
     def expand_persona(self, raw_instructions: str, bot_name: str, brand_details: str) -> str:
         """
-        Pings Groq's `openai/gpt-oss-120b` synchronously to expand a 1-sentence prompt 
+        Pings the configured LLM synchronously to expand a 1-sentence prompt 
         into a massive ReAct framework contextually tied to the brand.
         """
-        if not self.api_key:
-            logger.warning("[BOOTSTRAPPER] Missing GROQ_API_KEY. Defaulting to exact raw text.")
+        if not (os.getenv("MODELSLAB_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GROQ_API_KEY")):
+            logger.warning("[BOOTSTRAPPER] Missing paid provider API keys. Defaulting to exact raw text.")
             return raw_instructions
 
         if not raw_instructions or len(raw_instructions.strip()) < 5:
@@ -71,29 +73,22 @@ CRITICAL RULES:
 3. Incorporate the Brand Details implicitly.
 4. Output ONLY the raw expanded prompt text. Do not output conversational padding (e.g. "Here is your expanded prompt...")."""
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": self.model_id,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"USER RAW INSTRUCTIONS:\n{raw_instructions}"}
-            ],
-            "temperature": 0.4,
-            "max_tokens": 1500
-        }
-
         try:
-            logger.info(f"[BOOTSTRAPPER] Expanding core instructions via {self.model_id}...")
-            # Execute synchronously as this is managed by the route handler
-            response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
-            response.raise_for_status()
-            
-            data = response.json()
-            expanded_text = data["choices"][0]["message"]["content"].strip()
+            logger.info(f"[BOOTSTRAPPER] Expanding core instructions via {self.provider}/{self.model_id}...")
+            data = run_chat_completion(
+                provider=self.provider,
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": f"USER RAW INSTRUCTIONS:\n{raw_instructions}"},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=30,
+            )
+            expanded_text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if not expanded_text:
+                return raw_instructions
             return expanded_text
         except Exception as e:
             logger.error(f"[BOOTSTRAPPER] Expansion Engine Fault: {e}")

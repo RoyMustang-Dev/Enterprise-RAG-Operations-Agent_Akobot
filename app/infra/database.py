@@ -8,15 +8,143 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+import logging
+from contextvars import ContextVar
 
-# Place DB in the repo-level data directory
+# Place DBs in the repo-level data directory
 REPO_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = str(DATA_DIR / "crawler_data.db")
+TENANT_DIR = DATA_DIR / "tenants"
+APP_DB_NAME = "app_data.db"
+CRAWLER_DB_NAME = "crawler_data.db"
+logger = logging.getLogger(__name__)
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
+_CURRENT_TENANT: ContextVar[str] = ContextVar("CURRENT_TENANT_ID", default="global")
+
+def set_current_tenant(tenant_id: str | None):
+    if tenant_id:
+        _CURRENT_TENANT.set(tenant_id)
+    else:
+        _CURRENT_TENANT.set("global")
+    paths = get_db_paths(tenant_id)
+    logger.info(
+        "[DB] Tenant=%s app_db=%s crawler_db=%s",
+        paths.get("tenant"),
+        paths.get("app_db"),
+        paths.get("crawler_db"),
+    )
+
+def get_current_tenant() -> str:
+    return _CURRENT_TENANT.get() or "global"
+
+def _sanitize_tenant(tenant_id: str | None) -> str:
+    if not tenant_id:
+        return "global"
+    safe = "".join([c if c.isalnum() or c in ("-", "_") else "_" for c in tenant_id])
+    return safe[:64] or "global"
+
+def _resolve_db_path(db_kind: str, tenant_id: str | None) -> str:
+    tenant = _sanitize_tenant(tenant_id)
+    base_dir = TENANT_DIR / tenant
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        marker = base_dir / ".tenant_created"
+        if not marker.exists():
+            marker.write_text(str(time.time()))
+    except Exception:
+        pass
+    name = APP_DB_NAME if db_kind == "app" else CRAWLER_DB_NAME
+    return str(base_dir / name)
+
+def get_db_paths(tenant_id: str | None) -> dict:
+    tenant = _sanitize_tenant(tenant_id)
+    base_dir = TENANT_DIR / tenant
+    return {
+        "tenant": tenant,
+        "base_dir": str(base_dir),
+        "app_db": str(base_dir / APP_DB_NAME),
+        "crawler_db": str(base_dir / CRAWLER_DB_NAME),
+    }
+
+def cleanup_expired_tenant_dbs(ttl_days: int = 30):
+    """Delete tenant DB folders older than ttl_days based on creation marker."""
+    now = time.time()
+    if not TENANT_DIR.exists():
+        return 0
+    removed = 0
+    for tenant_dir in TENANT_DIR.iterdir():
+        if not tenant_dir.is_dir():
+            continue
+        marker = tenant_dir / ".tenant_created"
+        try:
+            if marker.exists():
+                created_ts = float(marker.read_text().strip())
+            else:
+                created_ts = tenant_dir.stat().st_mtime
+            age_days = (now - created_ts) / 86400
+            if age_days >= ttl_days:
+                # Safety: only delete known db files and marker
+                for name in [APP_DB_NAME, CRAWLER_DB_NAME, ".tenant_created"]:
+                    path = tenant_dir / name
+                    if path.exists():
+                        path.unlink(missing_ok=True)
+                # Remove dir if empty
+                try:
+                    tenant_dir.rmdir()
+                except Exception:
+                    pass
+                removed += 1
+        except Exception:
+            continue
+    return removed
+
+def purge_tenant_db(tenant_id: str) -> bool:
+    """Safely delete a single tenant DB folder."""
+    tenant = _sanitize_tenant(tenant_id)
+    tenant_dir = TENANT_DIR / tenant
+    if not tenant_dir.exists():
+        return False
+    try:
+        for name in [APP_DB_NAME, CRAWLER_DB_NAME, ".tenant_created"]:
+            path = tenant_dir / name
+            if path.exists():
+                path.unlink(missing_ok=True)
+        try:
+            tenant_dir.rmdir()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+def _get_conn(db_kind: str = "app", tenant_id: str | None = None):
+    """Robust connection helper avoiding OperationalErrors during high threading."""
+    last_err = None
+    tenant = tenant_id or get_current_tenant()
+    db_path = _resolve_db_path(db_kind, tenant)
+    for attempt in range(3):
+        try:
+            os.makedirs(str(DATA_DIR), exist_ok=True)
+            return sqlite3.connect(db_path, timeout=15, check_same_thread=False)
+        except sqlite3.OperationalError as e:
+            last_err = e
+            time.sleep(0.2 * (attempt + 1))
+        except Exception as e:
+            last_err = e
+            time.sleep(0.2 * (attempt + 1))
+
+    # Fallback to a writable user directory to prevent hard crashes.
+    try:
+        fallback_dir = Path.home() / ".enterprise_rag" / "tenants" / _sanitize_tenant(tenant)
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        fallback_db = str(fallback_dir / (APP_DB_NAME if db_kind == "app" else CRAWLER_DB_NAME))
+        logger.error(f"[DB] Falling back to user DB path: {fallback_db} (root cause: {last_err})")
+        return sqlite3.connect(fallback_db, timeout=15, check_same_thread=False)
+    except Exception:
+        raise last_err
+
+def init_db(tenant_id: str | None = None):
+    conn = _get_conn("crawler", tenant_id)
     c = conn.cursor()
 
     c.execute("""
@@ -35,9 +163,9 @@ def init_db():
     conn.commit()
     conn.close()
 
-def init_ingestion_db():
+def init_ingestion_db(tenant_id: str | None = None):
     """Ensures the ingestion job tracking table exists."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS ingestion_jobs (
@@ -50,9 +178,9 @@ def init_ingestion_db():
     conn.commit()
     conn.close()
 
-def init_chat_history_db():
+def init_chat_history_db(tenant_id: str | None = None):
     """Ensures the chat history table exists."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS chat_history (
@@ -66,9 +194,9 @@ def init_chat_history_db():
     conn.commit()
     conn.close()
 
-def init_ephemeral_collections_db():
+def init_ephemeral_collections_db(tenant_id: str | None = None):
     """Ensures the ephemeral collections table exists."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS ephemeral_collections (
@@ -79,9 +207,9 @@ def init_ephemeral_collections_db():
     conn.commit()
     conn.close()
 
-def init_session_collections_db():
+def init_session_collections_db(tenant_id: str | None = None):
     """Ensures the session->collection mapping table exists."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS session_collections (
@@ -94,9 +222,51 @@ def init_session_collections_db():
     conn.commit()
     conn.close()
 
-def init_session_cache_db():
+def init_seen_urls_db(tenant_id: str | None = None):
+    """Ensures the seen URLs table exists for crawler de-dup across runs."""
+    conn = _get_conn("crawler", tenant_id)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS seen_urls (
+        url TEXT PRIMARY KEY,
+        domain TEXT,
+        first_seen TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_seen_urls(domain: str, limit: int = 50000, tenant_id: str | None = None):
+    """Fetch a bounded set of previously seen URLs for a domain."""
+    init_seen_urls_db(tenant_id)
+    conn = _get_conn("crawler", tenant_id)
+    c = conn.cursor()
+    c.execute(
+        "SELECT url FROM seen_urls WHERE domain=? ORDER BY first_seen DESC LIMIT ?",
+        (domain, int(limit)),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return {r[0] for r in rows}
+
+def record_seen_url(url: str, domain: str, tenant_id: str | None = None):
+    """Persist a seen URL (idempotent)."""
+    if not url:
+        return
+    init_seen_urls_db(tenant_id)
+    conn = _get_conn("crawler", tenant_id)
+    c = conn.cursor()
+    ts = datetime.utcnow().isoformat()
+    c.execute(
+        "INSERT OR IGNORE INTO seen_urls (url, domain, first_seen) VALUES (?, ?, ?)",
+        (url, domain, ts),
+    )
+    conn.commit()
+    conn.close()
+
+def init_session_cache_db(tenant_id: str | None = None):
     """Ensures the session cache table exists."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS session_cache (
@@ -110,17 +280,17 @@ def init_session_cache_db():
     conn.commit()
     conn.close()
 
-def enable_wal():
-    conn = sqlite3.connect(DB_PATH)
+def enable_wal(db_kind: str = "crawler", tenant_id: str | None = None):
+    conn = _get_conn(db_kind, tenant_id)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.close()
 
-def insert_page_async(session_id, url, title, content, depth, status):
+def insert_page_async(session_id, url, title, content, depth, status, tenant_id: str | None = None):
     """
     Called ONLY by DB writer coroutine.
     Never from crawler workers.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("crawler", tenant_id)
     c = conn.cursor()
 
     ts = datetime.now().isoformat()
@@ -134,10 +304,10 @@ def insert_page_async(session_id, url, title, content, depth, status):
     conn.commit()
     conn.close()
 
-def upsert_ingestion_job(job_id: str, payload: dict, status: str = "pending"):
+def upsert_ingestion_job(job_id: str, payload: dict, status: str = "pending", tenant_id: str | None = None):
     """Insert or update ingestion job state."""
-    init_ingestion_db()
-    conn = sqlite3.connect(DB_PATH)
+    init_ingestion_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     ts = datetime.now().isoformat()
     payload_json = json.dumps(payload)
@@ -152,10 +322,10 @@ def upsert_ingestion_job(job_id: str, payload: dict, status: str = "pending"):
     conn.commit()
     conn.close()
 
-def get_ingestion_job(job_id: str):
+def get_ingestion_job(job_id: str, tenant_id: str | None = None):
     """Fetch a single ingestion job by id."""
-    init_ingestion_db()
-    conn = sqlite3.connect(DB_PATH)
+    init_ingestion_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM ingestion_jobs WHERE job_id=?", (job_id,))
@@ -169,10 +339,10 @@ def get_ingestion_job(job_id: str):
     payload["updated_at"] = row["updated_at"]
     return payload
 
-def save_chat_turn(session_id: str, role: str, content: str):
+def save_chat_turn(session_id: str, role: str, content: str, tenant_id: str | None = None):
     """Persist a single chat turn."""
-    init_chat_history_db()
-    conn = sqlite3.connect(DB_PATH)
+    init_chat_history_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     ts = datetime.utcnow().isoformat()
     c.execute(
@@ -182,14 +352,14 @@ def save_chat_turn(session_id: str, role: str, content: str):
     conn.commit()
     conn.close()
 
-def get_chat_history(session_id: str, limit: int = 20):
+def get_chat_history(session_id: str, limit: int = 20, tenant_id: str | None = None):
     """Fetch recent chat turns for a session."""
-    init_chat_history_db()
+    init_chat_history_db(tenant_id)
     try:
         limit = int(os.getenv("CHAT_HISTORY_LIMIT", limit))
     except Exception:
         limit = limit
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute(
@@ -200,9 +370,9 @@ def get_chat_history(session_id: str, limit: int = 20):
     conn.close()
     return [{"role": r["role"], "content": r["content"], "timestamp": r["timestamp"]} for r in rows]
 
-def record_ephemeral_collection(collection_name: str, created_at: float):
-    init_ephemeral_collections_db()
-    conn = sqlite3.connect(DB_PATH)
+def record_ephemeral_collection(collection_name: str, created_at: float, tenant_id: str | None = None):
+    init_ephemeral_collections_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute(
         "INSERT OR REPLACE INTO ephemeral_collections (collection_name, created_at) VALUES (?, ?)",
@@ -211,12 +381,12 @@ def record_ephemeral_collection(collection_name: str, created_at: float):
     conn.commit()
     conn.close()
 
-def upsert_session_collection(session_id: str, collection_name: str, created_at: float = None, updated_at: float = None):
-    init_session_collections_db()
+def upsert_session_collection(session_id: str, collection_name: str, created_at: float = None, updated_at: float = None, tenant_id: str | None = None):
+    init_session_collections_db(tenant_id)
     now = time.time()
     created_at = created_at or now
     updated_at = updated_at or now
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute(
         """
@@ -231,9 +401,9 @@ def upsert_session_collection(session_id: str, collection_name: str, created_at:
     conn.commit()
     conn.close()
 
-def get_session_collection(session_id: str):
-    init_session_collections_db()
-    conn = sqlite3.connect(DB_PATH)
+def get_session_collection(session_id: str, tenant_id: str | None = None):
+    init_session_collections_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM session_collections WHERE session_id=?", (session_id,))
@@ -248,9 +418,9 @@ def get_session_collection(session_id: str):
         "updated_at": row["updated_at"],
     }
 
-def get_session_cache(session_id: str):
-    init_session_cache_db()
-    conn = sqlite3.connect(DB_PATH)
+def get_session_cache(session_id: str, tenant_id: str | None = None):
+    init_session_cache_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM session_cache WHERE session_id=?", (session_id,))
@@ -267,13 +437,13 @@ def get_session_cache(session_id: str):
         "updated_at": row["updated_at"],
     }
 
-def upsert_session_cache(session_id: str, cache_payload: dict, last_query_hash: str = None, created_at: float = None, updated_at: float = None):
-    init_session_cache_db()
+def upsert_session_cache(session_id: str, cache_payload: dict, last_query_hash: str = None, created_at: float = None, updated_at: float = None, tenant_id: str | None = None):
+    init_session_cache_db(tenant_id)
     now = time.time()
     created_at = created_at or now
     updated_at = updated_at or now
     cache_json = json.dumps(cache_payload)
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute(
         """
@@ -289,25 +459,25 @@ def upsert_session_cache(session_id: str, cache_payload: dict, last_query_hash: 
     conn.commit()
     conn.close()
 
-def delete_session_cache(session_id: str):
-    init_session_cache_db()
-    conn = sqlite3.connect(DB_PATH)
+def delete_session_cache(session_id: str, tenant_id: str | None = None):
+    init_session_cache_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("DELETE FROM session_cache WHERE session_id=?", (session_id,))
     conn.commit()
     conn.close()
 
-def delete_session_collection_by_collection(collection_name: str):
-    init_session_collections_db()
-    conn = sqlite3.connect(DB_PATH)
+def delete_session_collection_by_collection(collection_name: str, tenant_id: str | None = None):
+    init_session_collections_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("DELETE FROM session_collections WHERE collection_name=?", (collection_name,))
     conn.commit()
     conn.close()
 
-def list_expired_collections(ttl_hours: int):
-    init_ephemeral_collections_db()
-    conn = sqlite3.connect(DB_PATH)
+def list_expired_collections(ttl_hours: int, tenant_id: str | None = None):
+    init_ephemeral_collections_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     cutoff = time.time() - (ttl_hours * 3600)
     c.execute(
@@ -318,16 +488,16 @@ def list_expired_collections(ttl_hours: int):
     conn.close()
     return [r[0] for r in rows]
 
-def delete_ephemeral_collection_record(collection_name: str):
-    init_ephemeral_collections_db()
-    conn = sqlite3.connect(DB_PATH)
+def delete_ephemeral_collection_record(collection_name: str, tenant_id: str | None = None):
+    init_ephemeral_collections_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
     c = conn.cursor()
     c.execute("DELETE FROM ephemeral_collections WHERE collection_name=?", (collection_name,))
     conn.commit()
     conn.close()
 
-def get_all_pages(session_id):
-    conn = sqlite3.connect(DB_PATH)
+def get_all_pages(session_id, tenant_id: str | None = None):
+    conn = _get_conn("crawler", tenant_id)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("SELECT * FROM crawled_pages WHERE session_id=?", (session_id,))
@@ -335,9 +505,9 @@ def get_all_pages(session_id):
     conn.close()
     return rows
 
-def get_latest_session_data(limit=50):
+def get_latest_session_data(limit=50, tenant_id: str | None = None):
     """Fetches pages from the most recent session."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_conn("crawler", tenant_id)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     # Get latest session_id

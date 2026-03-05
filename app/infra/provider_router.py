@@ -17,13 +17,16 @@ class ProviderRouter:
             "openai": bool(os.getenv("OPENAI_API_KEY")),
             "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
             "gemini": bool(os.getenv("GEMINI_API_KEY")),
+            "modelslab": bool(os.getenv("MODELSLAB_API_KEY")),
         }
         # Auto-routing is decided per-request (requested == "auto").
         # Keep priority order in code to avoid extra .env knobs.
-        self.preferred_order = ["groq", "openai", "anthropic", "gemini"]
+        # Prefer paid providers in this order: modelslab -> gemini -> groq (fallback)
+        # OpenAI/Anthropic remain available if explicitly requested.
+        self.preferred_order = ["modelslab", "gemini", "groq", "openai", "anthropic"]
 
     def select_provider(self, requested: str | None) -> str:
-        req = (requested or "groq").lower()
+        req = (requested or "auto").lower()
 
         # Explicit provider request
         if req != "auto":

@@ -50,6 +50,7 @@ from app.api.routes import router as api_router
 from app.infra.otel import init_otel
 from app.infra.hardware import HardwareProbe
 from app.infra.model_bootstrap import configure_model_cache, preload_models
+from app.infra.database import cleanup_expired_tenant_dbs, set_current_tenant
 
 # -----------------------------------------------------------------------------
 # FastAPI Application Initialization
@@ -87,6 +88,16 @@ for noisy_name in [
     "uvicorn.access",
 ]:
     logging.getLogger(noisy_name).setLevel(logging.WARNING)
+
+# Log provider availability summary once on boot
+logger.info(
+    "[BOOT] Providers: modelslab=%s gemini=%s groq=%s openai=%s anthropic=%s",
+    bool(os.getenv("MODELSLAB_API_KEY")),
+    bool(os.getenv("GEMINI_API_KEY")),
+    bool(os.getenv("GROQ_API_KEY")),
+    bool(os.getenv("OPENAI_API_KEY")),
+    bool(os.getenv("ANTHROPIC_API_KEY")),
+)
 
 # Configure CORS
 cors_origins = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
@@ -149,6 +160,29 @@ def _start_ephemeral_cleanup_daemon():
 
 _start_ephemeral_cleanup_daemon()
 
+# -----------------------------------------------------------------------------
+# Tenant DB Cleanup (Background Timer)
+# -----------------------------------------------------------------------------
+def _start_tenant_db_cleanup_daemon():
+    interval_hours = int(os.getenv("TENANT_DB_CLEANUP_INTERVAL_HOURS", "24"))
+    ttl_days = int(os.getenv("TENANT_DB_TTL_DAYS", "30"))
+
+    def _loop():
+        logger.info(f"[CLEANUP] Tenant DB cleanup started. Interval={interval_hours}h TTL={ttl_days}d")
+        while True:
+            try:
+                removed = cleanup_expired_tenant_dbs(ttl_days=ttl_days)
+                if removed:
+                    logger.info(f"[CLEANUP] Removed {removed} expired tenant DB folders.")
+            except Exception as e:
+                logger.warning(f"[CLEANUP] Tenant DB cleanup failed: {e}")
+            time.sleep(interval_hours * 3600)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+_start_tenant_db_cleanup_daemon()
+
 # Optional model preload (controlled by PRELOAD_MODELS=true)
 preload_models()
 
@@ -156,7 +190,13 @@ preload_models()
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.perf_counter()
-    response = await call_next(request)
+    # Bind tenant context for DB routing/logging
+    tenant_id = request.headers.get("x-tenant-id")
+    set_current_tenant(tenant_id)
+    try:
+        response = await call_next(request)
+    finally:
+        set_current_tenant(None)
     elapsed = round((time.perf_counter() - start) * 1000, 3)
     logger.info(f"{request.method} {request.url.path} -> {response.status_code} ({elapsed} ms)")
     try:
@@ -189,21 +229,32 @@ async def root():
 async def health_check():
     # Detect hardware probe targets actively during health checks
     from app.infra.hardware import HardwareProbe
+    from app.infra.model_registry import PHASE_MODELS
+    from app.infra.provider_router import ProviderRouter
     hw_config = HardwareProbe.detect_environment()
-    
+
+    router = ProviderRouter()
+    # Surface high-level model map (phase -> model) without secrets
+    phase_models = {k: v.get("model") for k, v in PHASE_MODELS.items()}
+
     return {
         "status": "healthy",
         "hardware_profile": hw_config,
-        "active_models": {
-            "synthesis": "llama-3.3-70b-versatile",
-            "metadata_extraction": "llama-3.1-8b-instant",
-            "verifier": "Sarvam M",
-            "reranker": "bge-reranker-large",
-            "embeddings": "BAAI/bge-large-en-v1.5"
-        }
+        "providers": {
+            "modelslab": bool(os.getenv("MODELSLAB_API_KEY")),
+            "gemini": bool(os.getenv("GEMINI_API_KEY")),
+            "groq": bool(os.getenv("GROQ_API_KEY")),
+            "openai": bool(os.getenv("OPENAI_API_KEY")),
+            "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
+            "preferred_order": router.preferred_order,
+        },
+        "active_models": phase_models,
+        "embeddings_provider": "gemini-embedding-001" if os.getenv("GEMINI_API_KEY") else "BAAI/bge-large-en-v1.5",
+        "stt_model": os.getenv("STT_MODEL_NAME", "openai/whisper-small"),
+        "tts_model": os.getenv("TTS_MODEL_NAME", "tts_models/en/ljspeech/tacotron2-DDC"),
     }
 
-@app.get("/metrics", include_in_schema=False)
+@app.get("/metrics", tags=["Observability"])
 async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 

@@ -14,6 +14,8 @@ import json
 import logging
 from app.infra.logging_utils import stage_info, stage_warn
 import requests
+from app.infra.llm_client import chat_completion
+from app.infra.model_registry import get_phase_model
 from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,11 @@ class HallucinationVerifier:
         self.use_sarvam = use_sarvam
         self.sarvam_key = os.getenv("SARVAM_API_KEY")
         self.groq_key = os.getenv("GROQ_API_KEY")
+        phase = get_phase_model("hallucination_verifier")
+        self.provider = phase["provider"]
+        self.model_id = phase["model"]
+        self.temperature = phase.get("temperature", 0.0)
+        self.max_tokens = phase.get("max_tokens", 600)
         
         from app.prompt_engine.groq_prompts.config import get_compiled_prompt
         self.system_prompt = get_compiled_prompt("hallucination_verifier", "sarvam-m")
@@ -40,6 +47,8 @@ class HallucinationVerifier:
         user_payload = f"DRAFT_ANSWER: {draft_answer}\n\nCONTEXT_CHUNKS:\n{context_block}"
         
         # Determine Routing Path (Prefer Sarvam)
+        if os.getenv("MODELSLAB_API_KEY"):
+             return self._invoke_modelslab(user_payload)
         if self.use_sarvam and self.sarvam_key:
              return self._invoke_sarvam(user_payload)
         elif self.groq_key:
@@ -68,6 +77,31 @@ class HallucinationVerifier:
             return json.loads(response.json()["choices"][0]["message"]["content"])
         except Exception as e:
             stage_warn(logger, "RAG:VERIFY", f"fallback_error={e}")
+            return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}
+
+    def _invoke_modelslab(self, payload_str: str) -> Dict[str, Any]:
+        try:
+            stage_info(logger, "RAG:VERIFY", "modelslab=true")
+            data = chat_completion(
+                provider=self.provider,
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": payload_str},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+                timeout=20,
+            )
+            raw = data["choices"][0]["message"]["content"]
+            return json.loads(raw)
+        except Exception as e:
+            stage_warn(logger, "RAG:VERIFY", f"modelslab_error={e}")
+            if self.use_sarvam and self.sarvam_key:
+                return self._invoke_sarvam(payload_str)
+            if self.groq_key:
+                return self._invoke_groq_fallback(payload_str)
             return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}
             
     def _invoke_sarvam(self, payload_str: str) -> Dict[str, Any]:

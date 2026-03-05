@@ -15,8 +15,9 @@ load_dotenv(override=True)
 
 import json
 import logging
-import aiohttp
 from typing import Dict, Any
+from app.infra.llm_client import achat_completion
+from app.infra.model_registry import get_phase_model
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +26,14 @@ class IntentClassifier:
     Executes a <400ms inference call establishing the conversational trajectory.
     """
     
-    def __init__(self, model_override: str = "llama-3.1-8b-instant", escalation_model: str = "llama-3.3-70b-versatile"):
-        self.api_key = os.getenv("GROQ_API_KEY")
-        self.model_id = model_override
-        self.escalation_model_id = escalation_model
+    def __init__(self, model_override: str = None, escalation_model: str = None):
+        phase = get_phase_model("intent_classifier")
+        esc = get_phase_model("intent_classifier_escalation")
+        self.provider = phase["provider"]
+        self.model_id = model_override or phase["model"]
+        self.escalation_model_id = escalation_model or esc["model"]
+        self.temperature = phase.get("temperature", 0.1)
+        self.max_tokens = phase.get("max_tokens", 120)
         
         from app.prompt_engine.groq_prompts.config import get_compiled_prompt
         self.system_prompt = get_compiled_prompt("intent_classifier", self.model_id)
@@ -44,7 +49,7 @@ class IntentClassifier:
         Returns:
             dict: The dictionary containing the exact routing path to follow.
         """
-        if not self.api_key:
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
              # Scaffolding fallback preventing 500 crashes during Phase 2/3 migration
              logger.warning("[SUPERVISOR] GROQ_API_KEY missing. Defaulting to 'rag_question'.")
              return {
@@ -74,32 +79,22 @@ class IntentClassifier:
 
     async def _execute_inference(self, target_model: str, user_prompt: str) -> Dict[str, Any]:
         """Executes the exact prompt context via fully non-blocking asynchronous I/O."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": target_model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            # Near determinism. We don't want the router 'hallucinating' paths.
-            "temperature": 0.1,
-            "max_completion_tokens": 120,
-            "response_format": {"type": "json_object"}
-        }
-        
         try:
             logger.info(f"[SUPERVISOR] Executing Async Intent Classification via {target_model}...")
-            async with aiohttp.ClientSession() as session:
-                async with session.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=8) as response:
-                    response.raise_for_status()
-                    
-                    data = await response.json()
-                    raw_content = data["choices"][0]["message"]["content"]
-                    return json.loads(raw_content)
+            data = await achat_completion(
+                provider=self.provider,
+                model=target_model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+                timeout=8,
+            )
+            raw_content = data["choices"][0]["message"]["content"]
+            return json.loads(raw_content)
                     
         except Exception as e:
              logger.error(f"[SUPERVISOR] Critical LLM async execution failure on {target_model}: {e}")

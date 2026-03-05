@@ -14,6 +14,7 @@ from qdrant_client.models import (
     MatchValue,
     MatchAny,
 )
+from qdrant_client.http.exceptions import UnexpectedResponse
 from typing import List, Dict, Any, Optional
 import os
 import uuid
@@ -53,6 +54,7 @@ class QdrantStore:
         self.collection_name = actual_collection
         self.path = path
         self.multi_tenant = os.getenv("QDRANT_MULTI_TENANT", "false").lower() == "true"
+        self._payload_index_cache = set()
 
         self.qdrant_url = os.getenv("QDRANT_URL")
         self.qdrant_api_key = os.getenv("QDRANT_API_KEY")
@@ -89,19 +91,64 @@ class QdrantStore:
             )
             logger.info(f"[QDRANT] Created new collection: {self.collection_name} with Cosine distance.")
 
-    def _ensure_payload_indexes(self):
+    def _ensure_payload_indexes(self, fields: Optional[List[str]] = None):
         """Ensure payload indexes exist for common filter fields."""
-        fields = ["document_type", "source_domain", "author", "creation_year", "source", "tenant_id"]
+        if fields is None:
+            fields = ["document_type", "source_domain", "author", "creation_year", "source", "tenant_id"]
         for field in fields:
+            if field in self._payload_index_cache:
+                continue
             try:
                 self.client.create_payload_index(
                     collection_name=self.collection_name,
                     field_name=field,
                     field_schema="keyword",
                 )
-            except Exception:
+                self._payload_index_cache.add(field)
+            except Exception as e:
                 # Ignore if index already exists or backend doesn't support it
-                pass
+                logger.debug(f"[QDRANT] Payload index ensure failed for {field}: {e}")
+
+    def _infer_payload_schema(self, value: Any) -> str:
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "float"
+        return "keyword"
+
+    def _ensure_payload_indexes_for_filters(self, metadata_filters: Optional[Dict[str, Dict[str, Any]]]):
+        if not metadata_filters:
+            return
+        for field, cfg in metadata_filters.items():
+            if not isinstance(cfg, dict):
+                continue
+            if field in self._payload_index_cache:
+                continue
+            value = cfg.get("value")
+            if value is None:
+                continue
+            sample = None
+            if isinstance(value, list):
+                for item in value:
+                    if item is not None:
+                        sample = item
+                        break
+            else:
+                sample = value
+            if sample is None:
+                continue
+            schema = self._infer_payload_schema(sample)
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field,
+                    field_schema=schema,
+                )
+                self._payload_index_cache.add(field)
+            except Exception as e:
+                logger.debug(f"[QDRANT] Payload index ensure failed for {field} ({schema}): {e}")
 
     def clear(self):
         """Hard-resets the active vector memory state."""
@@ -260,14 +307,40 @@ class QdrantStore:
         if not query_embedding:
             return []
 
+        # Auto-index any new metadata fields coming from the extractor.
+        self._ensure_payload_indexes_for_filters(metadata_filters)
         query_filter = self._build_qdrant_filter(metadata_filters, tenant_id=tenant_id)
         with self._lock:
-            search_result = self.client.query_points(
-                collection_name=self.collection_name,
-                query=query_embedding,
-                query_filter=query_filter,
-                limit=k,
-            )
+            try:
+                search_result = self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=query_embedding,
+                    query_filter=query_filter,
+                    limit=k,
+                )
+            except UnexpectedResponse as e:
+                # Safer path: if a payload index is missing, retry once without metadata filters.
+                msg = str(e)
+                if "Index required but not found" in msg:
+                    if "tenant_id" in msg:
+                        logger.warning("[QDRANT] tenant_id index missing; creating index and retrying once.")
+                        self._ensure_payload_indexes(fields=["tenant_id"])
+                        fallback_filter = query_filter
+                    else:
+                        # Drop dynamic metadata filters but keep tenant isolation if enabled.
+                        logger.warning("[QDRANT] Missing payload index for metadata filter. Retrying without metadata filters.")
+                        fallback_filter = self._build_qdrant_filter({}, tenant_id=tenant_id)
+                    try:
+                        search_result = self.client.query_points(
+                            collection_name=self.collection_name,
+                            query=query_embedding,
+                            query_filter=fallback_filter,
+                            limit=k,
+                        )
+                    except Exception:
+                        raise
+                else:
+                    raise
 
             results = []
             for hit in search_result.points:

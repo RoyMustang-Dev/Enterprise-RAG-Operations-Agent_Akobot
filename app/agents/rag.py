@@ -24,6 +24,7 @@ from app.retrieval.hybrid_search import HybridReranker
 from app.reasoning.synthesis import SynthesisEngine
 from app.reasoning.verifier import HallucinationVerifier
 from app.reasoning.formatter import ResponseFormatter
+from app.infra.model_registry import get_phase_model
 
 # Phase 13 Imports
 from app.rlhf.reward_model import OnlineRewardModel
@@ -117,8 +118,14 @@ class RAGAgent:
     async def node_extract_metadata(self, state: AgentState) -> AgentState:
         """Dynamically extracts strict Qdrant bounds from natural language."""
         query = state["query"]
-        extraction = await self.metadata_extractor.extract_filters(query)
-        logger.info("[STAGE:RAG:METADATA] extracted")
+        # Disable metadata extraction for session-only queries to avoid junk filters.
+        retrieval_scope = (state.get("retrieval_scope") or "").lower()
+        if retrieval_scope == "session_only":
+            extraction = {"filters": {}}
+            logger.info("[STAGE:RAG:METADATA] bypassed for session_only")
+        else:
+            extraction = await self.metadata_extractor.extract_filters(query)
+            logger.info("[STAGE:RAG:METADATA] extracted")
         
         # We store the applied filters in optimizations for audit tracking
         if "optimizations" not in state:
@@ -152,11 +159,11 @@ class RAGAgent:
         cached_chunks = None
         cache_created_at = None
         if session_id:
-            cached = get_session_cache(session_id)
+            cached = get_session_cache(session_id, tenant_id=tenant_id)
             if cached:
                 cache_created_at = cached.get("created_at")
                 if cache_created_at and (time.time() - cache_created_at) > cache_ttl_seconds:
-                    delete_session_cache(session_id)
+                    delete_session_cache(session_id, tenant_id=tenant_id)
                 else:
                     last_hash = cached.get("last_query_hash")
                     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
@@ -184,6 +191,8 @@ class RAGAgent:
             retrieve_k = 30
         else:
             retrieve_k = 20
+        state.setdefault("optimizations", {})
+        state["optimizations"]["retrieve_top_k"] = retrieve_k
         if cache_hit and cached_chunks is not None:
             chunks = cached_chunks
         else:
@@ -221,7 +230,7 @@ class RAGAgent:
                 query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
                 if cache_hit:
                     # Keep cache intact; refresh timestamps
-                    cached = get_session_cache(session_id)
+                    cached = get_session_cache(session_id, tenant_id=tenant_id)
                     if cached:
                         upsert_session_cache(
                             session_id,
@@ -229,10 +238,11 @@ class RAGAgent:
                             last_query_hash=query_hash,
                             created_at=cached.get("created_at"),
                             updated_at=time.time(),
+                            tenant_id=tenant_id,
                         )
                 else:
                     # Merge new chunks into cache
-                    cached = get_session_cache(session_id)
+                    cached = get_session_cache(session_id, tenant_id=tenant_id)
                     existing_chunks = []
                     created_at = None
                     if cached:
@@ -249,6 +259,7 @@ class RAGAgent:
                         last_query_hash=query_hash,
                         created_at=created_at,
                         updated_at=time.time(),
+                        tenant_id=tenant_id,
                     )
             except Exception as e:
                 logger.warning(f"[RAG AGENT] Session cache update failed: {e}")
@@ -258,7 +269,7 @@ class RAGAgent:
         state["optimizations"]["cache_notice"] = cache_notice
         if session_id:
             expires_at = None
-            cached = get_session_cache(session_id)
+            cached = get_session_cache(session_id, tenant_id=tenant_id)
             if cached and cached.get("created_at"):
                 expires_at = cached.get("created_at") + cache_ttl_seconds
             state["optimizations"]["cache_expires_at"] = expires_at
@@ -290,6 +301,11 @@ class RAGAgent:
         t0 = time.perf_counter()
         query = state["search_query"] or state["query"]
         raw_chunks = state["context_chunks"]
+
+        def _needs_source_coverage(state_obj: AgentState) -> bool:
+            # Always keep at least one chunk per file for session-only queries.
+            retrieval_scope = (state_obj.get("retrieval_scope") or "").lower()
+            return retrieval_scope == "session_only"
         
         # Compress 30 -> 5
         try:
@@ -303,16 +319,42 @@ class RAGAgent:
             top_k = max(base_top_k, 6)
         else:
             top_k = base_top_k
+        state.setdefault("optimizations", {})
+        state["optimizations"]["rerank_top_k"] = top_k
 
         model_override = state.get("optimizations", {}).get("reranker_model_name")
         reranker_enabled = os.getenv("RERANKER_ENABLED", "true").lower() == "true"
 
-        if not reranker_enabled:
-            refined_chunks = raw_chunks[:top_k]
+        if _needs_source_coverage(state):
+            # Log detected sources for transparency
+            # Ensure at least one chunk per source when user asks for "all attached files".
+            by_source = {}
+            for ch in raw_chunks:
+                src = ch.get("source") or ch.get("file") or ch.get("document") or ch.get("title")
+                if src and src not in by_source:
+                    by_source[src] = ch
+            logger.info(f"[STAGE:RAG:RERANK] enforcing source coverage for session_only sources={list(by_source.keys())}")
+            seeded = list(by_source.values())
+            if reranker_enabled:
+                model_name = model_override or os.getenv("RERANKER_MODEL_NAME", "llama-3.1-8b-instant")
+                reranker = SemanticReranker.get_instance(model_name=model_name)
+                ranked = reranker.rerank(query, raw_chunks, top_k=max(top_k, len(seeded)))
+            else:
+                ranked = raw_chunks
+            # Keep seeded sources first, then fill remaining
+            refined_chunks = seeded[:top_k]
+            for ch in ranked:
+                if len(refined_chunks) >= top_k:
+                    break
+                if ch not in refined_chunks:
+                    refined_chunks.append(ch)
         else:
-            model_name = model_override or os.getenv("RERANKER_MODEL_NAME", "llama-3.1-8b-instant")
-            reranker = SemanticReranker.get_instance(model_name=model_name)
-            refined_chunks = reranker.rerank(query, raw_chunks, top_k=top_k)
+            if not reranker_enabled:
+                refined_chunks = raw_chunks[:top_k]
+            else:
+                model_name = model_override or os.getenv("RERANKER_MODEL_NAME", "llama-3.1-8b-instant")
+                reranker = SemanticReranker.get_instance(model_name=model_name)
+                refined_chunks = reranker.rerank(query, raw_chunks, top_k=top_k)
         logger.info(f"[STAGE:RAG:RERANK] top_k={len(refined_chunks)}")
         state["context_chunks"] = refined_chunks
         t1 = time.perf_counter()
@@ -324,6 +366,48 @@ class RAGAgent:
         """Executes the dynamic generation bounded by the strictly retrieved chunks."""
         query = state["query"]
         chunks = state["context_chunks"]
+
+        # Build a compact chat history block to provide continuity without flooding context.
+        def _history_token_budget(model_name: str) -> int:
+            name = (model_name or "").lower()
+            # Conservative, model-aware budgets to avoid prompt bloat.
+            if "gemini-2.5-flash" in name or "gemini-2.5" in name:
+                return 2000
+            if "gemini-3-pro-image-preview" in name or "gemini-3-pro" in name:
+                return 1800
+            if "llama-3.3-70b" in name:
+                return 1600
+            if "llama-3.1-8b" in name:
+                return 800
+            if "qwen-qwen-2.5-coder-32b" in name or "qwen-2.5-coder" in name:
+                return 1200
+            return 1000
+
+        def _format_history(history: list, max_tokens: int) -> str:
+            if not history:
+                return ""
+            try:
+                import tiktoken
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                enc = None
+
+            lines = []
+            total = 0
+            # Walk from most recent to oldest, then reverse.
+            for msg in reversed(history):
+                role = (msg.get("role") or "").upper()
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    continue
+                token_count = len(enc.encode(content)) if enc else max(1, int(len(content) / 4))
+                if total + token_count > max_tokens:
+                    break
+                lines.append(f"{role}: {content}")
+                total += token_count
+            if not lines:
+                return ""
+            return "\n".join(reversed(lines))
         
         # -----------------------------------------------------------------
         # PART 2: THE COMPLEXITY ANALYZER (Enterprise Dynamic Routing)
@@ -338,22 +422,17 @@ class RAGAgent:
         else:
             word_count = len(query.split())
             chunk_count = len(chunks)
-            
             multi_hop_flags = ["compare", "contrast", "difference", "analyze", "resolve"]
             has_multi_hop = any(flag in query.lower() for flag in multi_hop_flags)
-            
             if word_count > 40 or has_multi_hop:
                 reasoning_effort = "high"
-                target_model = "openai/gpt-oss-120b"
-                target_temp = 0.2
             elif chunk_count > 4:
                 reasoning_effort = "medium"
-                target_model = "llama-3.3-70b-versatile"
-                target_temp = 0.2
             else:
                 reasoning_effort = "low"
-                target_model = "llama-3.3-70b-versatile"
-                target_temp = 0.0
+            phase = get_phase_model("rag_synthesis")
+            target_model = phase["model"]
+            target_temp = phase.get("temperature", 0.1)
             
         logger.info(f"[RAG AGENT] Complexity Analyzer computed -> Effort: {reasoning_effort.upper()} | Selected Engine: {target_model}")
         
@@ -380,15 +459,49 @@ class RAGAgent:
         
         # Pull Prompt Rewriter outputs if they successfully propagated
         optimized = state.get("optimized_prompts", {})
-        
+
+        # Inject compact chat history into synthesis prompts (without duplicating the current query).
+        history_budget = _history_token_budget(target_model)
+        history_block = _format_history(state.get("chat_history", []), max_tokens=history_budget)
+        if history_block:
+            base_user_prompt = f"CHAT HISTORY:\n{history_block}\n\nUSER_QUERY: {query}"
+        else:
+            base_user_prompt = query
+
         prompt_b = optimized.get("deep_high", {}).get("prompt", query)
+        if history_block:
+            prompt_b = f"CHAT HISTORY:\n{history_block}\n\nUSER_QUERY: {prompt_b}"
         
+        stream_cb = state.get("streaming_callback")
+        if stream_cb:
+            logger.info("[RAG AGENT] Streaming enabled. Using provider-native streaming for synthesis.")
+            llm_t0 = time.perf_counter()
+            result = await self.synthesis_engine.synthesize_stream(
+                prompt_b,
+                chunks,
+                target_model,
+                target_temp,
+                on_token=stream_cb,
+            )
+            llm_t1 = time.perf_counter()
+            state.setdefault("latency_optimizations", {})
+            state["latency_optimizations"]["llm_time_ms"] = round((llm_t1 - llm_t0) * 1000, 3)
+            state["answer"] = result.get("answer", "")
+            state["sources"] = result.get("provenance", [])
+            state["confidence"] = result.get("confidence", 0.95)
+            state["optimizations"]["tokens_input"] = result.get("tokens_input", 0)
+            state["optimizations"]["tokens_output"] = result.get("tokens_output", 0)
+            state["optimizations"]["temperature_used"] = result.get("temperature_used", 0.0)
+            # Streaming mode skips A/B reward selection to avoid conflicting live tokens.
+            state["optimizations"]["reward_score"] = 0.0
+            return state
+
         # Execute concurrent Candidate Syntheses via threadpool wrapping to prevent Event Loop deadlocks
         logger.info("[RAG AGENT] Spawning Concurrent A/B MoE Sythesis threads...")
         
         llm_t0 = time.perf_counter()
         # Offload the blocking requests.post network calls to worker threads
-        result_a_task = asyncio.to_thread(self.synthesis_engine.synthesize, query, chunks, target_model, target_temp)
+        result_a_task = asyncio.to_thread(self.synthesis_engine.synthesize, base_user_prompt, chunks, target_model, target_temp)
         result_b_task = asyncio.to_thread(self.synthesis_engine.synthesize, prompt_b, chunks, target_model, target_temp)
         
         # Await both LLM generations concurrently 
@@ -502,7 +615,7 @@ class RAGAgent:
         )
 
         override_model = state.get("optimizations", {}).get("override_model")
-        target_model = override_model or "llama-3.3-70b-versatile"
+        target_model = override_model or get_phase_model("rag_synthesis")["model"]
 
         result = await asyncio.to_thread(
             self.synthesis_engine.synthesize,

@@ -8,7 +8,8 @@ import logging
 from typing import Dict, Any, List
 from tenacity import retry, wait_exponential, stop_after_attempt
 import asyncio
-import aiohttp
+from app.infra.llm_client import achat_completion
+from app.infra.model_registry import get_phase_model
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +21,14 @@ class CoderAgent:
     and systemic analytical user intents. By isolating coding requests from the standard RAG pipeline, 
     we prevent the 70B language model from generating hallucinated code syntax and significantly reduce costs.
     """
-    def __init__(self, model_id: str = "qwen/qwen3-32b"):
-        self.model_id = model_id
-        
-        # We actively detect the key per the overarching Enterprise RAG standards.
-        self.api_key = os.getenv("GROQ_API_KEY") 
-        if not self.api_key:
-            logger.warning("[SECURITY] GROQ_API_KEY not found. Coder Agent Offline.")
+    def __init__(self, model_id: str = None):
+        phase = get_phase_model("coder_agent")
+        self.provider = phase["provider"]
+        self.model_id = model_id or phase["model"]
+        self.temperature = phase.get("temperature", 0.1)
+        self.max_tokens = phase.get("max_tokens", 4096)
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
+            logger.warning("[SECURITY] No API key found. Coder Agent Offline.")
             
         from app.prompt_engine.groq_prompts.config import get_compiled_prompt
         self.system_prompt = get_compiled_prompt("coder_agent", self.model_id)
@@ -37,7 +39,7 @@ class CoderAgent:
         Asynchronously parses the AgentState, extracts the user's programmatic intent, 
         and invokes the Qwen Coder model to synthesize structural output.
         """
-        if not self.api_key:
+        if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
             state["answer"] = "Coder Agent Offline: Missing API Key."
             state["confidence"] = 0.0
             return state
@@ -69,44 +71,29 @@ class CoderAgent:
                 user_payload = user_payload[:-overflow]
                 user_payload = user_payload.rsplit("\n", 1)[0] + "\n[Context truncated for safety]\n"
         
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": self.model_id,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_payload}
-            ],
-            "temperature": 0.1,  # highly deterministic for code
-            "max_completion_tokens": 4096
-        }
-
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=30
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    
-                    answer_text = data["choices"][0]["message"]["content"]
-                    # Strip any accidental chain-of-thought blocks if present
-                    # Remove any chain-of-thought blocks (with or without closing tag)
-                    answer_text = re.sub(r"<think>.*?</think>", "", answer_text, flags=re.DOTALL)
-                    answer_text = re.sub(r"<think>.*", "", answer_text, flags=re.DOTALL).strip()
-                    
-                    # Update State
-                    state["answer"] = answer_text
-                    # Coder models are generally highly confident in deterministic syntax
-                    state["confidence"] = 0.95 
-                    state["routed_agent"] = "qwen2.5-coder-32b"
-                    return state
+            data = await achat_completion(
+                provider=self.provider,
+                model=self.model_id,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_payload},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=30,
+            )
+            answer_text = data["choices"][0]["message"]["content"]
+            # Strip any accidental chain-of-thought blocks if present
+            answer_text = re.sub(r"<think>.*?</think>", "", answer_text, flags=re.DOTALL)
+            answer_text = re.sub(r"<think>.*", "", answer_text, flags=re.DOTALL).strip()
+            
+            # Update State
+            state["answer"] = answer_text
+            # Coder models are generally highly confident in deterministic syntax
+            state["confidence"] = 0.95 
+            state["routed_agent"] = self.model_id
+            return state
 
         except Exception as e:
             logger.error(f"[MoE - CODER AGENT] Code Synthesis failed: {e}")

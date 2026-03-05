@@ -53,7 +53,7 @@ def trim_chunks_by_token_budget(
     used = 0
     kept = []
     for item in chunks:
-        text = item.get("text", "")
+        text = item.get("text") or item.get("page_content") or ""
         t = estimate_tokens(text, model_name)
         if used + t > budget:
             break

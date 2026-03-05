@@ -8,14 +8,14 @@ graph TD
     classDef highlight fill:#e8eaf6,stroke:#3f51b5,stroke-width:3px;
 
     %% 1. Guard
-    User((User Input)) --> Guard{1. Prompt Guard<br/>llama-prompt-guard}
+    User((User Input)) --> Guard{1. Prompt Guard<br/>llama-guard-4-12b}
     class User input;
     class Guard verify;
 
     %% 2. Rewriter & SQLite
-    Guard -->|Safe| Rewriter[2. Prompt Rewriter<br/>gpt-oss-120b]
+    Guard -->|Safe| Rewriter[2. Prompt Rewriter<br/>llama-3.1-8b-instant]
     Guard -->|Malicious| Reject((Block))
-    DB[(SQLite Multi-Turn<br/>Chat History)] -.-> |"Context Provide"| Rewriter
+    DB[("SQLite Multi-Turn<br/>Chat History")] -.-> |"Context Provide"| Rewriter
     class Rewriter agent;
     class DB storage;
 
@@ -24,7 +24,7 @@ graph TD
     class Planner core;
 
     %% 4. Parallel Intent & Complexity
-    Planner --> Intent[4a. Intent Supervisor<br/>llama-3.1-8b]
+    Planner --> Intent[4a. Intent Supervisor<br/>llama-3.1-8b-instant]
     Planner --> Complexity[4b. Complexity Analyzer<br/>Heuristic Scoring]
     class Intent,Complexity core;
     
@@ -33,31 +33,32 @@ graph TD
     class Bypass,Coder agent;
 
     %% 6. Metadata
-    Intent -->|RAG Query| Metadata[6. Metadata Extractor<br/>llama-3.1-8b]
+    Intent -->|RAG Query| Metadata[6. Metadata Extractor<br/>llama-3.1-8b-instant]
     class Metadata agent;
 
     %% 7. Retrieval & 8. Rerank
     Metadata --> VectorDB[(7. Qdrant Search<br/>Top 30 Chunks)]
     class VectorDB storage;
     
-    VectorDB --> Rerank{8. Cross-Encoder<br/>Rerank Top 5 (Sigmoid)}
+    VectorDB --> Rerank{8. LLM Reranker<br/>llama-3.1-8b-instant}
     class Rerank core;
 
     %% 9. Synthesis
-    Complexity -->|Model Route| Synth[9. Adaptive Synthesis<br/>llama-70b OR gpt-120b]
+    Complexity -->|Model Route| Synth["9. Adaptive Synthesis<br/>gemini-2.5-flash (ModelsLab)"]
     Rerank --> Synth
     class Synth highlight;
 
     %% 10. Verifier
-    Synth --> Verifier{10. Fact Verifier<br/>Sarvam M}
-    Verifier -.->|Hallucination Detected<br/>(Correction Loop)| Synth
+    Synth --> Verifier{10. Fact Verifier<br/>llama-3.3-70b-versatile-versatile}
+    Verifier -.->|"Hallucination Detected<br/>(Correction Loop)"| Synth
     class Verifier verify;
 
     %% 11. Formatter & 12. Telemetry
     Verifier -->|Verified Text| Formatter[11. Markup Formatter]
-    Formatter --> Telemetry[(12. Telemetry & RLHF<br/>audit_logs.jsonl)]
+    Formatter --> Telemetry[("12. Telemetry & RLHF<br/>audit_logs.jsonl")]
     class Formatter agent;
     class Telemetry storage;
     
     Telemetry --> Output((Final JSON Output))
     class Output input;
+

@@ -1,4 +1,0 @@
-{"timestamp": "2026-02-27T00:23:46.059509", "session_id": "test-session-123", "rating": "up", "feedback_text": "test", "metadata": {"case": "smoke"}}
-{"timestamp": "2026-02-27T01:40:54.198744", "session_id": "test-session-abc", "rating": "up", "feedback_text": "works", "metadata": {"case": "post-restart"}}
-{"timestamp": "2026-02-27T03:42:34.724547", "session_id": "session-123", "rating": "up", "feedback_text": "Great answer.", "metadata": {"case": "smoke"}}
-{"timestamp": "2026-03-03T11:19:27.304045", "session_id": "excel-test", "rating": "up", "feedback_text": "Great answer.", "metadata": {"case": "smoke"}}

@@ -56,7 +56,8 @@ def preload_models():
         _ = TextToSpeech().tts
     except Exception as e:
         logger.error(f"[MODEL PRELOAD] TTS preload failed: {e}")
-        raise RuntimeError(f"Failed to preload TTS: {e}")
+        # Do not hard-fail boot if TTS isn't installed.
+        return
 
 
 def ensure_paddle_runtime():
