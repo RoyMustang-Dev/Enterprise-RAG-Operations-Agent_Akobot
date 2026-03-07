@@ -427,7 +427,7 @@ Vision Caption:
 curl -X POST "https://modelslab.com/api/v6/image_editing/caption" \
   -H "Content-Type: application/json" \
   -d '{
-    "key":"YOUR_KEY",
+  "key":"YOUR_KEY",
     "init_image":"https://example.com/image.png",
     "length":"normal",
     "base64":false
@@ -719,3 +719,96 @@ Input required for this Phase: text to speak
 Output required from this Phase: audio file (wav/mp3)
 System Prompt (previous): SYSTEM: You are the Live Vocal Interface... (voice rules)
 Modified System Prompt: SYSTEM: You are the Live Vocal Interface... (unchanged; JSON not required).
+
+---
+
+## Command Log (Benchmarks + VPS Setup)
+
+### VPS: crawler-only setup (Ubuntu)
+`ssh akobot-agent@server.akobot.ai`  
+Connect to the VPS using the provided SSH user and host.
+
+`sudo apt update && sudo apt upgrade -y`  
+Refresh system packages.
+
+`sudo apt install -y python3 python3-venv python3-pip`  
+Install Python tooling.
+
+`python3 -m venv venv`  
+Create a virtual environment.
+
+`source ~/venv/bin/activate`  
+Activate the virtual environment.
+
+`pip install aiohttp selectolax markdownify playwright`  
+Install crawler-only dependencies.
+
+`python -m playwright install --with-deps`  
+Install Playwright browsers + system deps (inside venv).
+
+### VPS: copy standalone crawler benchmark script (from local machine)
+`scp "D:\WorkSpace\Enterprise-RAG-Operations-Agent_POC\tools\standalone_crawler_benchmark.py" akobot-agent@server.akobot.ai:~/crawler_benchmark.py`  
+Copy the standalone crawler benchmark script to the VPS home directory.
+
+### VPS: create benchmark runner script
+```
+cat << 'EOF' > run_crawler_benchmarks.sh
+#!/usr/bin/env bash
+set -e
+
+source ~/venv/bin/activate
+
+LOG="crawler_benchmark_$(date +%Y%m%d_%H%M%S).log"
+echo "Logging to $LOG"
+
+run() {
+  url="$1"
+  echo "======================================" | tee -a "$LOG"
+  echo "Benchmarking: $url" | tee -a "$LOG"
+  python ~/crawler_benchmark.py --url "$url" --depth 2 --max-seconds 60 2>&1 | tee -a "$LOG"
+}
+
+run "https://docs.python.org/3/"
+run "https://learnnect.com"
+run "https://www.amazon.in/s?i=electronics&rh=n%3A1389401031%2Cp_123%3A46655%2Cp_36%3A1010000-&dc&qid=1772677681&rnid=1318502031&ref=sr_nr_p_36_0_0"
+run "https://www.goibibo.com/hotels/hotels-in-delhi-ct/"
+
+echo "Done. Log saved in $LOG"
+EOF
+```
+Create a single script that runs all benchmarks sequentially.
+
+`chmod +x run_crawler_benchmarks.sh`  
+Make the script executable.
+
+`./run_crawler_benchmarks.sh`  
+Run the full benchmark suite on VPS (depth=2).
+
+### VPS: list and copy benchmark logs back to local machine
+`ssh akobot-agent@server.akobot.ai "ls -lh ~/crawler_benchmark_*.log"`  
+List benchmark logs on the VPS.
+
+`scp akobot-agent@server.akobot.ai:~/crawler_benchmark_*.log D:\WorkSpace\Enterprise-RAG-Operations-Agent_POC\`  
+Copy benchmark log(s) from VPS to local machine.
+
+### Local: run crawler benchmarks with local venv + .env (Windows)
+`cd D:\WorkSpace\Enterprise-RAG-Operations-Agent_POC`  
+Enter repo root.
+
+`.\venv\Scripts\activate`  
+Activate local Python venv.
+
+`Get-Content .env | ForEach-Object { if ($_ -match "^(\\w+)=(.*)$") { [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2]) } }`  
+Load .env into current PowerShell session.
+
+`python tools\standalone_crawler_benchmark.py --url "https://docs.python.org/3/" --depth 2 --max-seconds 60`  
+Run benchmark on normal docs site.
+
+`python tools\standalone_crawler_benchmark.py --url "https://learnnect.com" --depth 2 --max-seconds 60`  
+Run benchmark on JS-heavy site.
+
+`python tools\standalone_crawler_benchmark.py --url "https://www.amazon.in/s?i=electronics&rh=n%3A1389401031%2Cp_123%3A46655%2Cp_36%3A1010000-&dc&qid=1772677681&rnid=1318502031&ref=sr_nr_p_36_0_0" --depth 2 --max-seconds 60`  
+Run benchmark on e-commerce site.
+
+`python tools\standalone_crawler_benchmark.py --url "https://www.goibibo.com/hotels/hotels-in-delhi-ct/" --depth 2 --max-seconds 60`  
+Run benchmark on booking site.

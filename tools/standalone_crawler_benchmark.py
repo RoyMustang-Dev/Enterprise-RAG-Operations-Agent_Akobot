@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Standalone crawler benchmark (no repo dependencies).
+Standalone crawler benchmark (no repo dependencies), aligned with main crawler behavior.
 Usage:
-  python standalone_crawler_benchmark.py --url https://example.com --depth 3
+  python standalone_crawler_benchmark.py --url https://example.com --depth 2
 """
 import argparse
 import asyncio
@@ -22,7 +22,26 @@ from xml.etree import ElementTree
 
 import aiohttp
 from selectolax.parser import HTMLParser
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, Page, BrowserContext
+
+
+def _cpu_cores() -> int:
+    try:
+        return os.cpu_count() or 4
+    except Exception:
+        return 4
+
+
+def _crawler_workers() -> int:
+    env_val = os.getenv("CRAWLER_WORKERS")
+    if env_val and env_val.isdigit():
+        return int(env_val)
+    cores = _cpu_cores()
+    return max(2, min(8, cores // 2 or 2))
+
+
+def _bool_env(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).lower() == "true"
 
 
 class SeenUrlStore:
@@ -39,9 +58,12 @@ class SeenUrlStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_domain ON seen_urls(domain)")
             conn.commit()
 
-    def get_all(self) -> set:
+    def get_all(self, domain: str, limit: int = 50000) -> set:
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute("SELECT url FROM seen_urls").fetchall()
+            rows = conn.execute(
+                "SELECT url FROM seen_urls WHERE domain=? ORDER BY ts DESC LIMIT ?",
+                (domain, int(limit)),
+            ).fetchall()
             return {r[0] for r in rows}
 
     def record(self, url: str, domain: str):
@@ -61,11 +83,18 @@ class CrawlerService:
         self.allowed_links = []
         self.blocked_links = []
         self._robots_cache: Dict[str, urllib.robotparser.RobotFileParser] = {}
-        self._domain_semaphores = defaultdict(lambda: asyncio.Semaphore(6))
+        workers = _crawler_workers()
+        self._domain_semaphores = defaultdict(lambda: asyncio.Semaphore(max(2, min(8, workers))))
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._pattern_seen = set()
         self._content_hash_counts = defaultdict(int)
         self._content_hash_cap = 2
+        self._proxy_pool = [p.strip() for p in os.getenv("CRAWLER_PROXY_URLS", "").split(",") if p.strip()]
+
+    def _pick_proxy(self) -> Optional[str]:
+        if not self._proxy_pool:
+            return None
+        return random.choice(self._proxy_pool)
 
     def _canonicalize_url(self, url: str) -> str:
         if not url:
@@ -134,9 +163,8 @@ class CrawlerService:
             parsed = urlparse(url)
             qs = parse_qs(parsed.query)
             for key in ["page", "p"]:
-                if key in qs:
-                    if int(qs[key][0]) > cap:
-                        return True
+                if key in qs and int(qs[key][0]) > cap:
+                    return True
             parts = [p for p in parsed.path.split("/") if p]
             for i, part in enumerate(parts[:-1]):
                 if part == "page" and int(parts[i + 1]) > cap:
@@ -244,6 +272,21 @@ class CrawlerService:
         except Exception:
             return True
 
+    async def _close_popups(self, page: Page):
+        selectors = [
+            "button[id*='cookie']", "button[class*='cookie']",
+            "button[id*='accept']", "button[class*='accept']",
+            "button[aria-label*='close']", ".modal-close", "div[aria-label*='cookie'] button",
+            "text=Accept All", "text=Agree", "text=No Thanks", "text=Accept",
+        ]
+        try:
+            for sel in selectors:
+                if await page.isVisible(sel, timeout=200):
+                    await page.click(sel, timeout=200)
+                    break
+        except Exception:
+            pass
+
     async def _auto_scroll(self, page: Page):
         try:
             dims = await page.evaluate("({h: document.body.scrollHeight, v: window.innerHeight})")
@@ -252,10 +295,11 @@ class CrawlerService:
             steps = max(1, min(6, int(total / view)))
         except Exception:
             steps = 2
+        pause_ms = int(os.getenv("CRAWLER_SCROLL_PAUSE_MS", "250"))
         for _ in range(steps):
             try:
                 await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(pause_ms / 1000)
             except Exception:
                 break
 
@@ -335,13 +379,13 @@ class CrawlerService:
             return True
         return low_text_ratio or low_text_abs
 
-    async def _fetch_static(self, url: str) -> Optional[dict]:
+    async def _fetch_static(self, url: str, proxy: str = None) -> Optional[dict]:
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         timeout = aiohttp.ClientTimeout(total=12)
         try:
-            async with self._http_session.get(url, headers=headers, timeout=timeout) as resp:
+            async with self._http_session.get(url, headers=headers, proxy=proxy, timeout=timeout) as resp:
                 if resp.status >= 400:
                     return None
                 html = await resp.text(errors="ignore")
@@ -358,9 +402,27 @@ class CrawlerService:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context()
+
+                async def _route(route, request):
+                    if request.resource_type in ["image", "media", "font"]:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await context.route("**/*", _route)
                 page = await context.new_page()
                 await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                await self._auto_scroll(page)
+                await self._close_popups(page)
+                if _bool_env("CRAWLER_SCROLL", "true"):
+                    await self._auto_scroll(page)
+                wait_sel = os.getenv("CRAWLER_WAIT_SELECTORS", "").strip()
+                if wait_sel:
+                    for sel in [s.strip() for s in wait_sel.split(",") if s.strip()]:
+                        try:
+                            await page.wait_for_selector(sel, timeout=1500)
+                            break
+                        except Exception:
+                            continue
                 html = await page.content()
                 title = await page.title()
                 await context.close()
@@ -372,10 +434,9 @@ class CrawlerService:
     async def crawl_url(
         self,
         url: str,
-        max_depth: int = 3,
+        max_depth: int = 2,
         max_urls: int = 200,
-        max_seconds: float = 30,
-        http_only: bool = True,
+        max_seconds: float = 60,
     ) -> dict:
         self._http_session = aiohttp.ClientSession()
         seed = self._canonicalize_url(url)
@@ -390,12 +451,14 @@ class CrawlerService:
 
         queue = asyncio.Queue()
         visited = set()
-        seen = self._seen_store.get_all()
+        seen = self._seen_store.get_all(domain)
         start_ts = time.perf_counter()
         pages_crawled = 0
 
         for u in seed_urls:
             queue.put_nowait((u, 0))
+
+        fast_http_only = _bool_env("CRAWLER_FAST_HTTP_ONLY", "false")
 
         while not queue.empty():
             if max_seconds and (time.perf_counter() - start_ts) > max_seconds:
@@ -416,8 +479,9 @@ class CrawlerService:
             visited.add(norm_url)
             self._seen_store.record(norm_url, urlparse(norm_url).netloc)
 
-            content = await self._fetch_static(norm_url)
-            if (not content) and (not http_only or self._force_playwright_domain(domain)):
+            proxy = self._pick_proxy()
+            content = await self._fetch_static(norm_url, proxy=proxy)
+            if (not content) and (not fast_http_only or self._force_playwright_domain(domain)):
                 content = await self._fetch_playwright(norm_url)
             if not content:
                 queue.task_done()
@@ -437,12 +501,28 @@ class CrawlerService:
                 continue
             self._content_hash_counts[content_hash] += 1
 
+            page_type = "general"
+            p = urlparse(current_url).path.lower()
+            if "/product" in p:
+                page_type = "product"
+            elif "/pricing" in p:
+                page_type = "pricing"
+            elif "/docs" in p or "/documentation" in p:
+                page_type = "docs"
+            elif "/blog" in p:
+                page_type = "blog"
+            elif "/help" in p or "/support" in p:
+                page_type = "support"
+            elif "/category" in p or "/listing" in p:
+                page_type = "listing"
+
             doc = {
                 "url": current_url,
                 "title": title,
                 "content": clean_content,
                 "depth": depth,
                 "quality_score": quality_score,
+                "page_type": page_type,
                 "ts": datetime.utcnow().isoformat(),
             }
             out_path = os.path.join(self.out_dir, f"{hashlib.md5(current_url.encode()).hexdigest()}.json")
@@ -493,7 +573,6 @@ async def run_benchmark(args):
         max_depth=args.depth,
         max_urls=args.max_urls,
         max_seconds=args.max_seconds,
-        http_only=args.http_only,
     )
     end = time.perf_counter()
     total = end - start
@@ -511,10 +590,9 @@ async def run_benchmark(args):
 def parse_args():
     p = argparse.ArgumentParser(description="Standalone crawler benchmark")
     p.add_argument("--url", required=True, help="Seed URL to crawl")
-    p.add_argument("--depth", type=int, default=3, help="Max crawl depth")
+    p.add_argument("--depth", type=int, default=2, help="Max crawl depth")
     p.add_argument("--max-urls", type=int, default=200, help="Max URLs to crawl")
-    p.add_argument("--max-seconds", type=float, default=30, help="Time limit in seconds")
-    p.add_argument("--http-only", action="store_true", help="HTTP-only (no Playwright fallback)")
+    p.add_argument("--max-seconds", type=float, default=60, help="Time limit in seconds")
     p.add_argument("--out-dir", default="./crawler_out", help="Output folder for crawled JSON")
     p.add_argument("--seen-db", default="./crawler_out/seen_urls.db", help="SQLite DB path for seen URLs")
     return p.parse_args()
