@@ -5,7 +5,8 @@ Responsible for slicing massive raw document strings into mathematically bounded
 WARNING: This uses a legacy word-count splitter. Phase 8 will introduce 
 Token-Aware `RecursiveCharacterTextSplitter` to align perfectly with the BAAI Embedding token ceilings.
 """
-from typing import List, Dict, Optional
+from typing import List
+import os
 import threading
 
 _TOKENIZER_LOCK = threading.Lock()
@@ -20,6 +21,16 @@ def _get_tokenizer():
             from transformers import AutoTokenizer
             _TOKENIZER = AutoTokenizer.from_pretrained("BAAI/bge-large-en-v1.5")
     return _TOKENIZER
+
+def _resolve_chunk_params(chunk_size: int, overlap: int) -> tuple[int, int]:
+    env_chunk = os.getenv("INGEST_CHUNK_SIZE")
+    env_overlap = os.getenv("INGEST_CHUNK_OVERLAP")
+    if env_chunk and env_chunk.isdigit():
+        chunk_size = int(env_chunk)
+    if env_overlap and env_overlap.isdigit():
+        overlap = int(env_overlap)
+    return chunk_size, overlap
+
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
     """
@@ -42,7 +53,12 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
         tokenizer = _get_tokenizer()
-        
+        chunk_size, overlap = _resolve_chunk_params(chunk_size, overlap)
+        max_len = getattr(tokenizer, "model_max_length", 512) or 512
+        # Keep a small buffer to avoid boundary overflows.
+        chunk_size = min(chunk_size, max_len - 8)
+        overlap = min(overlap, max(0, chunk_size // 2))
+
         splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
             tokenizer,
             chunk_size=chunk_size,
@@ -54,6 +70,10 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     except Exception as e:
         print(f"Error during token-aware splitting: {e}")
         # Fallback to naive splitting if tokenizer fails
+        chunk_size, overlap = _resolve_chunk_params(chunk_size, overlap)
+        # Conservative fallback to avoid model max token overflow.
+        chunk_size = min(chunk_size, 200)
+        overlap = min(overlap, max(0, chunk_size // 2))
         words = text.split()
         chunks = []
         start = 0

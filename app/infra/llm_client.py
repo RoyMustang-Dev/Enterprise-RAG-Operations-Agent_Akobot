@@ -7,7 +7,9 @@ Currently supports: modelslab, gemini, groq.
 from __future__ import annotations
 
 import os
+import asyncio
 import json
+import time
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -181,33 +183,51 @@ async def achat_completion(
         raise RuntimeError(f"API key missing for provider: {provider}")
 
     req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format)
+    groq_retries = int(os.getenv("GROQ_RETRY_MAX", "3")) if provider.lower() == "groq" else 1
+    backoff = float(os.getenv("GROQ_RETRY_BACKOFF_SEC", "1.5"))
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(req["url"], headers=req["headers"], json=req["payload"], timeout=timeout) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                if req.get("adapter") == "modelslab" and isinstance(data, dict) and data.get("status") == "error":
-                    msg = data.get("message", "")
-                    if "temperature" in msg and "default (1)" in msg:
-                        retry_payload = dict(req["payload"])
-                        retry_payload["temperature"] = 1
-                        async with session.post(req["url"], headers=req["headers"], json=retry_payload, timeout=timeout) as retry_resp:
-                            retry_resp.raise_for_status()
-                            data = await retry_resp.json()
-                    else:
-                        raise RuntimeError(f"ModelsLab error: {msg}")
-                if req.get("adapter") == "gemini":
-                    # Normalize Gemini response to OpenAI-style dict
-                    text = ""
-                    try:
-                        text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    except Exception:
+            for attempt in range(groq_retries):
+                async with session.post(req["url"], headers=req["headers"], json=req["payload"], timeout=timeout) as resp:
+                    if provider.lower() == "groq" and resp.status in (429, 500, 502, 503, 504):
+                        if attempt < groq_retries - 1:
+                            await asyncio.sleep(backoff * (2 ** attempt))
+                            continue
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    if req.get("adapter") == "modelslab" and isinstance(data, dict) and data.get("status") == "error":
+                        msg = data.get("message", "")
+                        if "temperature" in msg and "default (1)" in msg:
+                            retry_payload = dict(req["payload"])
+                            retry_payload["temperature"] = 1
+                            async with session.post(req["url"], headers=req["headers"], json=retry_payload, timeout=timeout) as retry_resp:
+                                retry_resp.raise_for_status()
+                                data = await retry_resp.json()
+                        else:
+                            if "out of credits" in msg.lower() and os.getenv("GEMINI_API_KEY"):
+                                logger.warning("[LLM] ModelsLab out of credits; falling back to Gemini.")
+                                return await achat_completion(
+                                    provider="gemini",
+                                    model=model,
+                                    messages=messages,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    response_format=response_format,
+                                    timeout=timeout,
+                                )
+                            raise RuntimeError(f"ModelsLab error: {msg}")
+                    if req.get("adapter") == "gemini":
+                        # Normalize Gemini response to OpenAI-style dict
                         text = ""
-                    return {
-                        "choices": [{"message": {"content": text}}],
-                        "raw": data,
-                    }
-                return data
+                        try:
+                            text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        except Exception:
+                            text = ""
+                        return {
+                            "choices": [{"message": {"content": text}}],
+                            "raw": data,
+                        }
+                    return data
     except Exception as e:
         logger.error(f"[LLM] Async request failed provider={provider} model={model}: {e}")
         raise
@@ -317,10 +337,19 @@ def chat_completion(
         raise RuntimeError(f"API key missing for provider: {provider}")
 
     req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format)
+    groq_retries = int(os.getenv("GROQ_RETRY_MAX", "3")) if provider.lower() == "groq" else 1
+    backoff = float(os.getenv("GROQ_RETRY_BACKOFF_SEC", "1.5"))
     try:
-        resp = requests.post(req["url"], headers=req["headers"], json=req["payload"], timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        data = None
+        for attempt in range(groq_retries):
+            resp = requests.post(req["url"], headers=req["headers"], json=req["payload"], timeout=timeout)
+            if provider.lower() == "groq" and resp.status_code in (429, 500, 502, 503, 504):
+                if attempt < groq_retries - 1:
+                    time.sleep(backoff * (2 ** attempt))
+                    continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
         if req.get("adapter") == "modelslab" and isinstance(data, dict) and data.get("status") == "error":
             msg = data.get("message", "")
             if "temperature" in msg and "default (1)" in msg:
@@ -330,6 +359,17 @@ def chat_completion(
                 resp.raise_for_status()
                 data = resp.json()
             else:
+                if "out of credits" in msg.lower() and os.getenv("GEMINI_API_KEY"):
+                    logger.warning("[LLM] ModelsLab out of credits; falling back to Gemini.")
+                    return chat_completion(
+                        provider="gemini",
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        response_format=response_format,
+                        timeout=timeout,
+                    )
                 raise RuntimeError(f"ModelsLab error: {msg}")
         if req.get("adapter") == "gemini":
             text = ""
@@ -342,6 +382,19 @@ def chat_completion(
                 "raw": data,
             }
         return data
+    except requests.exceptions.Timeout as e:
+        # ModelsLab retry with longer timeout
+        if provider.lower() == "modelslab":
+            retry_timeout = int(os.getenv("MODELSLAB_TIMEOUT_RETRY_SEC", "45"))
+            try:
+                resp = requests.post(req["url"], headers=req["headers"], json=req["payload"], timeout=retry_timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                return data
+            except Exception:
+                pass
+        logger.error(f"[LLM] Sync request failed provider={provider} model={model}: {e}")
+        raise
     except Exception as e:
         logger.error(f"[LLM] Sync request failed provider={provider} model={model}: {e}")
         raise

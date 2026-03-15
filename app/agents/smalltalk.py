@@ -8,6 +8,7 @@ to user specs, instead of hardcoded dev strings.
 """
 import logging
 from typing import Dict, Any
+import re
 
 from app.prompt_engine.groq_prompts.config import get_compiled_prompt, PersonaCacheManager
 from app.infra.model_registry import get_phase_model
@@ -63,6 +64,15 @@ class SmalltalkAgent:
                 timeout=20,
             )
             answer = data.get("choices", [{}])[0].get("message", {}).get("content")
+            # Guardrail: avoid "analysis of the user's message" for greetings.
+            if query and isinstance(answer, str):
+                lowered_q = re.sub(r"(.)\1{2,}", r"\1\1", query.lower())
+                tokens = re.sub(r"[^a-z\s]", " ", lowered_q)
+                tokens = re.sub(r"\s+", " ", tokens).strip()
+                greeting_terms = {"hi", "hii", "hello", "hey", "heyy", "hiya", "yo"}
+                is_greeting = any(t in greeting_terms for t in tokens.split()) or "help me" in tokens or "how can you help" in tokens
+                if is_greeting:
+                    answer = f"Hi! I'm {bot_name}. How can I help you today?"
             state["answer"] = answer
             state["confidence"] = 0.99
             

@@ -120,5 +120,44 @@ class SemanticReranker:
                         
         except Exception as e:
              logger.error(f"[META-RANKER] LLM Judge execution crashed: {e}")
+             # Fallback to Gemini, then Groq (if available)
+             fallback_attempts = []
+             gemini_model = os.getenv("RERANKER_GEMINI_MODEL", "gemini-2.5-flash")
+             groq_model = os.getenv("RERANKER_GROQ_MODEL", self.model_name)
+             if os.getenv("GEMINI_API_KEY"):
+                 fallback_attempts.append(("gemini", gemini_model))
+             if os.getenv("GROQ_API_KEY") and self.provider != "groq":
+                 fallback_attempts.append(("groq", groq_model))
+             for provider, model in fallback_attempts:
+                 try:
+                     logger.warning(f"[META-RANKER] Fallback rerank via {provider}:{model}")
+                     data = await achat_completion(
+                         provider=provider,
+                         model=model,
+                         messages=[
+                             {"role": "system", "content": self.system_prompt},
+                             {"role": "user", "content": payload_string},
+                         ],
+                         temperature=self.temperature,
+                         max_tokens=self.max_tokens,
+                         response_format={"type": "json_object"},
+                         timeout=12,
+                     )
+                     raw_content = data["choices"][0]["message"]["content"]
+                     result = json.loads(raw_content)
+                     ranked_list = result.get("ranked_chunks", [])
+                     scored_chunks = []
+                     for rank_data in ranked_list:
+                         c_id = rank_data.get("chunk_id")
+                         if c_id is not None and 0 <= c_id < len(context_chunks):
+                             chunk = context_chunks[int(c_id)]
+                             chunk["rerank_score"] = float(rank_data.get("rerank_score", 0.0))
+                             scored_chunks.append(chunk)
+                     if scored_chunks:
+                         sorted_chunks = sorted(scored_chunks, key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+                         sorted_chunks = [ch for ch in sorted_chunks if ch.get("rerank_score", 0.0) > 0.10]
+                         return sorted_chunks[:top_k]
+                 except Exception as fallback_err:
+                     logger.warning(f"[META-RANKER] Fallback rerank failed: {fallback_err}")
              logger.warning("[META-RANKER] Failsafe: Reverting to raw Vector Cosine Distance ordering.")
              return context_chunks[:top_k]

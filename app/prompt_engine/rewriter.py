@@ -7,6 +7,7 @@ import logging
 from typing import Dict, Any
 from tenacity import retry, wait_exponential, stop_after_attempt
 import asyncio
+import re
 from app.infra.llm_client import achat_completion
 from app.infra.model_registry import get_phase_model
 
@@ -33,11 +34,60 @@ class PromptRewriter:
         from app.prompt_engine.groq_prompts.config import get_compiled_prompt
         self.system_prompt = get_compiled_prompt("query_rewriter", self.model_id)
 
+    @staticmethod
+    def _normalize_greeting(text: str) -> str:
+        if not text:
+            return text
+        lowered = text.lower().strip()
+        # Collapse repeated characters: "hiiiiii" -> "hii"
+        lowered = re.sub(r"(.)\1{2,}", r"\1\1", lowered)
+        # Basic typo normalization
+        lowered = lowered.replace("helo", "hello").replace("helloo", "hello").replace("hh", "h")
+        lowered = lowered.replace("whow", "how").replace("cna", "can").replace("elph", "help").replace("mee", "me")
+        tokens = re.sub(r"[^a-z\s]", " ", lowered)
+        tokens = re.sub(r"\s+", " ", tokens).strip()
+        if not tokens:
+            return "Hi! How can you help me?"
+        if "help me" in tokens or "can you help" in tokens or "how can you help" in tokens:
+            return "Hi! How can you help me?"
+        if tokens in {"hi", "hii", "hello", "hey", "hey there"} or tokens.startswith(("hi ", "hello ", "hey ")):
+            return "Hi! How can you help me?"
+        return "Hi! How can you help me?"
+
+    @staticmethod
+    def _looks_like_greeting(text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        lowered = re.sub(r"(.)\1{2,}", r"\1\1", lowered)
+        lowered = lowered.replace("whow", "how").replace("cna", "can").replace("elph", "help").replace("mee", "me")
+        tokens = re.sub(r"[^a-z\s]", " ", lowered)
+        tokens = re.sub(r"\s+", " ", tokens).strip()
+        if not tokens:
+            return False
+        greeting_terms = {"hi", "hii", "hello", "hey", "heyy", "hiya", "yo"}
+        token_list = tokens.split()
+        if any(t in greeting_terms for t in token_list):
+            return True
+        if "how can you help me" in tokens or "what can you do" in tokens or "help me" in tokens:
+            return True
+        return False
+
     @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
     async def rewrite(self, user_prompt: str, intent_classification: str = "rag_question") -> Dict[str, Any]:
         """
         Asynchronously invokes the MoE controller to synthesize optimized prompt variants.
         """
+        if self._looks_like_greeting(user_prompt):
+            normalized = self._normalize_greeting(user_prompt)
+            return {
+                "original_user_prompt": user_prompt,
+                "prompts": {
+                    "concise_low": {"prompt": normalized, "recommended_model": "llama-3.1-8b-instant", "temperature": 0.0},
+                    "standard_med": {"prompt": normalized, "recommended_model": "llama-3.1-8b-instant", "temperature": 0.0},
+                    "deep_high": {"prompt": normalized, "recommended_model": "llama-3.1-8b-instant", "temperature": 0.0},
+                }
+            }
         if not os.getenv("MODELSLAB_API_KEY") and not os.getenv("GROQ_API_KEY"):
             # Dev-Fallback / Bypass
             return {

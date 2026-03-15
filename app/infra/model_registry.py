@@ -42,7 +42,7 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     "security_guard": {
         "provider": "groq",
         "fallback_provider": "gemini",
-        "model": "meta-llama/llama-guard-4-12b",
+        "model": "llama-3.1-8b-instant",
         "temperature": 0.0,
         "max_tokens": 20,
     },

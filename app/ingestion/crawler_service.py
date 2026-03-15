@@ -1,4 +1,4 @@
-﻿"""
+"""
 Crawler Service Component.
 
 Refactored for High Performance & Reliability:
@@ -919,7 +919,7 @@ class CrawlerService:
                 await self._http_session.close()
                 self._http_session = None
 
-            rows = get_all_pages(session_id)
+            rows = get_all_pages(session_id, tenant_id=self.tenant_id)
 
             full = ""
             for r in rows:

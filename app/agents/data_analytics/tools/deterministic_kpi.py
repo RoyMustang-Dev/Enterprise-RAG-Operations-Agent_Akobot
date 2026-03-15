@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Dict, List, Any, Optional, Tuple
 
 import pandas as pd
@@ -98,6 +99,112 @@ def compute_deterministic_summary(df: pd.DataFrame) -> str:
         return "Summary generated, but grouping failed due to schema complexity."
 
     return " ".join(summary_lines) if summary_lines else "Summary generated, but no dominant groups found."
+
+
+def _parse_unique_id(value: str) -> Tuple[str, str]:
+    if not value:
+        return ("Unknown", "Unknown")
+    if "_" in value:
+        head, tail = value.split("_", 1)
+        return head.strip() or "Unknown", tail.strip() or "Unknown"
+    return ("All", value)
+
+
+def load_forecast_dataframe(forecast_csv_url: str) -> pd.DataFrame:
+    if not forecast_csv_url:
+        return pd.DataFrame()
+    try:
+        rel = forecast_csv_url.replace("/api/v1/exports/", "")
+        export_dir = os.path.join(os.getcwd(), "data", "exports")
+        path = os.path.join(export_dir, rel)
+        if not os.path.exists(path):
+            return pd.DataFrame()
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_forecast_table(
+    forecast_df: pd.DataFrame,
+    metric_label: str = "units_sold",
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if forecast_df.empty:
+        return rows
+    if "unique_id" in forecast_df.columns:
+        for _, r in forecast_df.iterrows():
+            region, product = _parse_unique_id(str(r.get("unique_id", "")))
+            rows.append({
+                "region": region,
+                "product": product,
+                "date": str(r.get("ds", ""))[:10],
+                "metric": metric_label,
+                "forecast_value": float(r.get("y_forecast", 0.0)),
+                "lower_ci": None,
+                "upper_ci": None
+            })
+        return rows
+    if "ds" in forecast_df.columns and "yhat" in forecast_df.columns:
+        for _, r in forecast_df.iterrows():
+            rows.append({
+                "region": "All",
+                "product": "All",
+                "date": str(r.get("ds", ""))[:10],
+                "metric": metric_label,
+                "forecast_value": float(r.get("yhat", 0.0)),
+                "lower_ci": None,
+                "upper_ci": None
+            })
+    return rows
+
+
+def compute_per_region_summaries(
+    forecast_table: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    if not forecast_table:
+        return []
+
+    df = pd.DataFrame(forecast_table)
+    if df.empty:
+        return []
+    try:
+        df["forecast_value"] = pd.to_numeric(df["forecast_value"], errors="coerce")
+        df = df.dropna(subset=["forecast_value"])
+        if df.empty:
+            return []
+        summaries: List[Dict[str, Any]] = []
+        for region, region_df in df.groupby("region"):
+            top_products = []
+            for product, prod_df in region_df.groupby("product"):
+                prod_df = prod_df.sort_values("date")
+                start = prod_df["forecast_value"].iloc[0]
+                end = prod_df["forecast_value"].iloc[-1]
+                if start == 0:
+                    delta_pct = 0.0
+                else:
+                    delta_pct = ((end - start) / abs(start)) * 100.0
+                direction = "up" if delta_pct > 0 else "down" if delta_pct < 0 else "flat"
+                top_products.append({
+                    "product": str(product),
+                    "forecast_delta_percent": float(delta_pct),
+                    "direction": direction,
+                    "reason": f"Forecast moved from {start:.2f} to {end:.2f}."
+                })
+            # Sort by absolute delta and keep top 3
+            top_products = sorted(top_products, key=lambda x: abs(x.get("forecast_delta_percent", 0)), reverse=True)[:3]
+            overall_direction = "flat"
+            if top_products:
+                avg_delta = sum(p["forecast_delta_percent"] for p in top_products) / len(top_products)
+                overall_direction = "up" if avg_delta > 0 else "down" if avg_delta < 0 else "flat"
+            summaries.append({
+                "region": str(region),
+                "top_products": top_products,
+                "overall_region_trend": overall_direction,
+                "notes": f"{len(top_products)} products evaluated."
+            })
+        return summaries
+    except Exception:
+        return []
 
 
 def _safe_sum(df: pd.DataFrame, col: str) -> Optional[float]:
@@ -294,6 +401,7 @@ def compute_segments(df: pd.DataFrame) -> List[Dict[str, Any]]:
 def compute_time_windows(df: pd.DataFrame) -> Dict[str, Any]:
     if df.empty:
         return {}
+    return {}
 
 
 def compute_governance_checks(df: pd.DataFrame) -> List[Dict[str, Any]]:

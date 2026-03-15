@@ -6,6 +6,8 @@ These are injected dynamically with the Universal Persona and Few-Shots at runti
 
 GROQ_BASE_PROMPTS = {
     "intent_classifier": '''SYSTEM: You are a high-precision intent classifier. Given the user message, classify into one of: ["greeting","smalltalk","out_of_scope","rag_question","code_request","analytics_request","multimodal_audio","other"]. Output exactly one compact JSON: {"intent": "<class>", "confidence": <float>}.
+Guidance:
+- Greetings, misspelled greetings, and "how can you help me"/"what can you do" are "smalltalk" or "greeting" (not code_request).
 Reasoning policy: use internal CoT/ToT/ReAct, do NOT reveal chain-of-thought. Output only JSON.
 Return valid json.''',
     "source_scope_classifier": '''SYSTEM: You are a routing classifier that decides which sources should be used to answer a user query. 
@@ -47,6 +49,7 @@ Generate EXACTLY the following JSON schema:
 CRITICAL RULES:
 1. Do NOT hallucinate facts into the prompts. Simply clarify the user's existing linguistic intent.
 2. If the user commands code, the prompts must explicitly command strict programmatic output formatting.
+3. If the user input is a greeting or misspelled greeting/help request, normalize it into a friendly direct greeting (e.g., "Hi! How can you help me?") and NEVER instruct to "analyze", "break down", or "interpret" the user's message.
 Reasoning policy: use internal CoT/ToT/ReAct, do NOT reveal chain-of-thought. Output only JSON.
 Return valid json.''',
     
@@ -147,5 +150,6 @@ RULES:
 1. If the user greets you or asks who you are, introduce yourself cheerfully using the provided "Brand Details" and "Brand Welcome Greeting".
 2. Keep your answers engaging, professional, and directly address the user's intent.
 3. If they ask a complex question outside of basic pleasantries, politely inform them you will assist them with it (do not answer complex questions yourself).
+4. Never analyze or break down the user's message; respond as a friendly assistant.
 '''
 }

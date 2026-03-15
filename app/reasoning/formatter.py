@@ -10,6 +10,8 @@ are injected as Markdown `[Citation: ID]` inline links within the raw text.
 import logging
 from app.infra.logging_utils import stage_info
 from typing import Dict, Any, List
+import re
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,25 @@ class ResponseFormatter:
          formatted_answer = state.get("answer", "")
          claims = state.get("verification_claims", [])
          stage_info(logger, "RAG:FORMAT", "formatting_response")
+
+         # If answer is wrapped in a JSON block, extract the "answer" field for clean UX.
+         if isinstance(formatted_answer, str) and "```" in formatted_answer:
+             try:
+                 match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", formatted_answer, re.DOTALL)
+                 candidate = match.group(1) if match else None
+                 if not candidate:
+                     start = formatted_answer.find("{")
+                     end = formatted_answer.rfind("}")
+                     if start != -1 and end != -1 and end > start:
+                         candidate = formatted_answer[start:end + 1]
+                 if candidate:
+                     parsed = json.loads(candidate)
+                     extracted = parsed.get("answer")
+                     if extracted:
+                         formatted_answer = extracted
+             except Exception:
+                 # Best-effort fallback: strip code fences
+                 formatted_answer = re.sub(r"```(?:json)?", "", formatted_answer).replace("```", "").strip()
          
          # Append visual warning if the Independent Verifier caught a logic flaw
          if state.get("is_hallucinated", False):

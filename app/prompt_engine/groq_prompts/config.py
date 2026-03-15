@@ -85,6 +85,8 @@ def get_compiled_prompt(stage: str, model: str) -> str:
     persona_partial_max_chars = int(os.getenv("PERSONA_PARTIAL_MAX_CHARS", "800"))
     
     persona_block = ""
+    if injection_mode in {"off", "none", "disabled"}:
+        persona = None
     if persona:
         expanded = (persona.get("expanded_prompt", "") or "").strip()
         if len(expanded) > persona_max_chars:

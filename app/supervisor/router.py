@@ -54,6 +54,62 @@ class ExecutionGraph:
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
         text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
         return text.strip()
+
+    @staticmethod
+    def _sanitize_rewrite(original: str, rewritten: str) -> str:
+        if not rewritten:
+            return original
+        lowered = rewritten.strip().lower()
+        if not lowered:
+            return original
+        # Avoid meta-instructions from the rewriter; use original in that case.
+        meta_markers = [
+            "interpret the user",
+            "interpret the user's input",
+            "rewrite the user",
+            "rephrase the user",
+            "optimize the prompt",
+            "improve the prompt",
+            "your task is to",
+            "you are asked to",
+        ]
+        if any(m in lowered for m in meta_markers):
+            return original
+        return rewritten
+
+    @staticmethod
+    def _looks_like_greeting(text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        lowered = re.sub(r"(.)\1{2,}", r"\1\1", lowered)
+        lowered = lowered.replace("whow", "how").replace("cna", "can").replace("elph", "help").replace("mee", "me")
+        tokens = re.sub(r"[^a-z\s]", " ", lowered)
+        tokens = re.sub(r"\s+", " ", tokens).strip()
+        if not tokens:
+            return False
+        token_list = tokens.split()
+        greeting_terms = {"hi", "hii", "hello", "hey", "heyy", "hiya", "yo"}
+        if any(t in greeting_terms for t in token_list):
+            return True
+        if "how can you help me" in tokens or "what can you do" in tokens or "help me" in tokens:
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_greeting(text: str) -> str:
+        if not text:
+            return "Hi! How can you help me?"
+        lowered = text.lower().strip()
+        lowered = re.sub(r"(.)\1{2,}", r"\1\1", lowered)
+        lowered = lowered.replace("whow", "how").replace("cna", "can").replace("elph", "help").replace("mee", "me")
+        tokens = re.sub(r"[^a-z\s]", " ", lowered)
+        tokens = re.sub(r"\s+", " ", tokens).strip()
+        if "help me" in tokens or "can you help" in tokens or "how can you help" in tokens:
+            return "Hi! How can you help me?"
+        if tokens in {"hi", "hii", "hello", "hey", "hey there"} or tokens.startswith(("hi ", "hello ", "hey ")):
+            return "Hi! How can you help me?"
+        return "Hi! How can you help me?"
         
     async def invoke(self, query: str, chat_history: list = None, session_id: str = "", tenant_id: str = None, model_provider: str = "auto", extra_collections: list = None, reranker_profile: str = "auto", reranker_model_name: str = None, force_session_context: bool = False, streaming_callback=None) -> AgentState:
         """
@@ -108,6 +164,7 @@ class ExecutionGraph:
         state["optimizations"]["reranker_profile"] = reranker_profile
         if reranker_model_name:
             state["optimizations"]["reranker_model_name"] = reranker_model_name
+        config: Dict[str, Any] = {}
         
         # Persist the user turn immediately
         if session_id:
@@ -117,11 +174,37 @@ class ExecutionGraph:
                 pass
 
         # -------------------------------------------------------------
-        # STEP 1: SAFETY (Prompt Injection Guard)
+        # STEP 1: PROMPT OPTIMIZATION (MoE Rewriter) - Run FIRST
+        # -------------------------------------------------------------
+        original_query = query
+        rewrite_data = await self.rewriter.rewrite(query, "unknown")
+        state["optimized_prompts"] = rewrite_data.get("prompts", {})
+        rewritten = (
+            state["optimized_prompts"].get("standard_med", {}) or {}
+        ).get("prompt") or query
+        rewritten = self._sanitize_rewrite(query, rewritten)
+        state["optimizations"]["original_query"] = query
+        state["optimizations"]["rewritten_query"] = rewritten
+        query = rewritten
+        state["query"] = query
+        stage_info(logger, "ROUTER:REWRITE", "rewriter_completed=true")
+
+        # -------------------------------------------------------------
+        # STEP 2: SAFETY (Prompt Injection Guard)
         # -------------------------------------------------------------
         # Guard uses blocking HTTP; offload to thread so API event loop stays responsive.
         safety_report = await asyncio.to_thread(self.guard.evaluate, query)
         if safety_report.get("is_malicious", False):
+            original_query = state["optimizations"].get("original_query") or query
+            if original_query != query:
+                original_report = await asyncio.to_thread(self.guard.evaluate, original_query)
+                if not original_report.get("is_malicious", False):
+                    stage_info(logger, "ROUTER:GUARD", "action=soft_allow_original")
+                    query = original_query
+                    state["query"] = query
+                    safety_report = original_report
+                else:
+                    safety_report = original_report
             guard_strict = os.getenv("GUARD_STRICT", "false").lower() == "true"
             if not guard_strict:
                 soft_allow = os.getenv("GUARD_SOFT_ALLOW", "true").lower() == "true"
@@ -165,7 +248,7 @@ class ExecutionGraph:
                 return state
             
         # -------------------------------------------------------------
-        # STEP 2: REASONING (Intent + Complexity in Parallel)
+        # STEP 3: REASONING (Intent + Complexity in Parallel)
         # -------------------------------------------------------------
         intent_task = self.classifier.classify(query)
         complexity_task = self.complexity.score(query)
@@ -174,9 +257,17 @@ class ExecutionGraph:
         state["intent"] = intent_report.get("intent", "rag_question")
         state["optimizations"]["complexity_score"] = complexity_score
         stage_info(logger, "ROUTER:INTENT", f"intent={state['intent']} conf={intent_report.get('confidence')}")
+
+        # Override intent for greeting-like messages to avoid misclassification.
+        if self._looks_like_greeting(original_query):
+            state["intent"] = "smalltalk"
+            normalized = self._normalize_greeting(original_query)
+            state["query"] = normalized
+            state["optimizations"]["rewritten_query"] = normalized
+            stage_info(logger, "ROUTER:INTENT", "intent_override=smalltalk_greeting")
         
         # -------------------------------------------------------------
-        # STEP 3: ADAPTIVE PLANNING (Dynamic Routing)
+        # STEP 4: ADAPTIVE PLANNING (Dynamic Routing)
         # -------------------------------------------------------------
         plan = self.planner.generate_plan(state)
         state["reasoning_effort"] = plan.get("reasoning_effort", state["reasoning_effort"])
@@ -200,15 +291,6 @@ class ExecutionGraph:
             logger.warning(f"[ROUTER] Source scope classifier failed; defaulting to 'both': {e}")
             state["retrieval_scope"] = "both"
 
-        # -------------------------------------------------------------
-        # STEP 4: PROMPT OPTIMIZATION (MoE Rewriter)
-        # -------------------------------------------------------------
-        if plan.get("run_rewriter", True):
-            # Generate 3 canonical prompts with explicit Temp/Token Metadata
-            rewrite_data = await self.rewriter.rewrite(query, state["intent"])
-            state["optimized_prompts"] = rewrite_data.get("prompts", {})
-            stage_info(logger, "ROUTER:REWRITE", "rewriter_completed=true")
-        
         # -------------------------------------------------------------
         # STEP 5: EXECUTION FORK (MoE / ReAct Routing)
         # -------------------------------------------------------------
@@ -243,7 +325,13 @@ class ExecutionGraph:
              logger.info(f"[ROUTER] Dispatching payload to the {state['intent']} Coder Agent.")
              state["optimizations"]["agent_routed"] = "coder_agent"
              # We execute solely against the Coder MoE ignoring dense 70B RAG chains
-             final_state = await self.coder_agent.ainvoke(state, config=config)
+             try:
+                 final_state = await self.coder_agent.ainvoke(state, config=config)
+             except Exception as e:
+                 logger.error(f"[ROUTER] Coder agent failed: {e}")
+                 final_state = dict(state)
+                 final_state["answer"] = "The code assistant is temporarily unavailable. Please try again shortly."
+                 final_state["confidence"] = 0.2
              if not final_state.get("verifier_verdict"):
                  final_state["verifier_verdict"] = "N/A"
              if "sources" not in final_state:
@@ -263,7 +351,14 @@ class ExecutionGraph:
              state["optimizations"]["agent_routed"] = "rag_agent"
              
              # Execute the end-to-end RAG pipeline
-             final_state = await self.rag_agent.ainvoke(state, config=config)
+             try:
+                 final_state = await self.rag_agent.ainvoke(state, config=config)
+             except Exception as e:
+                 logger.error(f"[ROUTER] RAG agent failed: {e}")
+                 final_state = dict(state)
+                 final_state["answer"] = "The retrieval system is temporarily unavailable. Please try again shortly."
+                 final_state["confidence"] = 0.2
+                 final_state.setdefault("sources", [])
              final_state["answer"] = self._strip_think(final_state.get("answer", ""))
              final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
              if session_id:

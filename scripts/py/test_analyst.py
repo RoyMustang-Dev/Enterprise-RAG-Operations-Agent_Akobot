@@ -3,14 +3,14 @@ import json
 import uuid
 
 URL = "http://localhost:8000/api/v1/business_analyst/chat"
-FILE_PATH = "dummy_sales_data.csv"
+FILE_PATH = r"D:\WorkSpace\Enterprise-RAG-Operations-Agent_POC\data\uploads\marketing_ecommerce_benchmark.csv"
 
 # First, construct the multipart form data payload
 session_id = str(uuid.uuid4())
 query = "What is the total revenue over this time period, and what is the trend of the conversion rate?"
 
 with open(FILE_PATH, "rb") as f:
-    files = {"files": ("dummy_sales_data.csv", f, "text/csv")}
+    files = {"files": ("marketing_ecommerce_benchmark.csv", f, "text/csv")}
     data = {"query": query, "session_id": session_id}
     headers = {"x-tenant-id": "default"}
     

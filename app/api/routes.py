@@ -660,15 +660,30 @@ async def chat_endpoint(
             asyncio.create_task(_run_orchestrator())
 
             async def event_gen():
+                buffer = ""
+                last_flush = time.perf_counter()
                 while True:
                     if done_event.is_set() and token_queue.empty():
                         break
                     try:
                         tok = await asyncio.wait_for(token_queue.get(), timeout=0.2)
                         if tok:
-                            yield f"data: {tok}\n\n"
+                            buffer += tok
+                            now = time.perf_counter()
+                            if len(buffer) >= 120 or (now - last_flush) > 0.4:
+                                yield f"data: {buffer}\n\n"
+                                buffer = ""
+                                last_flush = now
                     except asyncio.TimeoutError:
+                        # Periodically flush partial buffer to avoid long pauses.
+                        if buffer and (time.perf_counter() - last_flush) > 0.6:
+                            yield f"data: {buffer}\n\n"
+                            buffer = ""
+                            last_flush = time.perf_counter()
                         continue
+
+                if buffer:
+                    yield f"data: {buffer}\n\n"
 
                 result = result_holder.get("result") or {}
                 if not streamed_any["value"]:
@@ -1098,6 +1113,15 @@ async def ingest_crawler_endpoint(
 )
 async def check_progress_endpoint(job_id: str):
     """Poll asynchronous ingestion/crawler job progress."""
+    celery_enabled = os.getenv("CELERY_ENABLED", "false").lower() == "true"
+    if celery_enabled and os.getenv("CELERY_BROKER_URL"):
+        stored = get_ingestion_job(job_id)
+        if stored is not None:
+            return stored
+        if job_id in ingestion_jobs:
+            return ingestion_jobs[job_id]
+        raise HTTPException(status_code=404, detail="Ingestion Job ID not found.")
+
     if job_id in ingestion_jobs:
         return ingestion_jobs[job_id]
 
@@ -1325,123 +1349,129 @@ async def transcribe_audio_endpoint(
         file_bytes = await audio_file.read()
         modelslab_key = os.getenv("MODELSLAB_API_KEY")
         if modelslab_key:
-            import aiohttp
-            import base64
-            import asyncio
+            try:
+                import aiohttp
+                import base64
+                import asyncio
 
-            # 1) Upload audio as base64 to get a URL
-            mime = "audio/wav" if ext == ".wav" else "audio/mpeg"
-            b64 = base64.b64encode(file_bytes).decode("utf-8")
-            init_audio = f"data:{mime};base64,{b64}"
-            upload_payload = {"key": modelslab_key, "init_audio": init_audio}
+                # 1) Upload audio as base64 to get a URL
+                mime = "audio/wav" if ext == ".wav" else "audio/mpeg"
+                b64 = base64.b64encode(file_bytes).decode("utf-8")
+                init_audio = f"data:{mime};base64,{b64}"
+                upload_payload = {"key": modelslab_key, "init_audio": init_audio}
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://modelslab.com/api/v6/voice/base64_to_url",
-                    json=upload_payload,
-                    timeout=60,
-                ) as resp:
-                    resp.raise_for_status()
-                    upload_result = await resp.json()
-                    if upload_result.get("status") == "error":
-                        raise HTTPException(status_code=502, detail=_mask_secret(f"ModelsLab STT Upload Error: {upload_result.get('message', upload_result)}"))
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://modelslab.com/api/v6/voice/base64_to_url",
+                        json=upload_payload,
+                        timeout=60,
+                    ) as resp:
+                        resp.raise_for_status()
+                        upload_result = await resp.json()
+                        if upload_result.get("status") == "error":
+                            raise HTTPException(status_code=502, detail=_mask_secret(f"ModelsLab STT Upload Error: {upload_result.get('message', upload_result)}"))
 
-            audio_url = None
-            if isinstance(upload_result.get("output"), list) and upload_result["output"]:
-                audio_url = upload_result["output"][0]
-            if not audio_url and isinstance(upload_result.get("audio_url"), str):
-                audio_url = upload_result.get("audio_url")
-            if not audio_url and isinstance(upload_result.get("fetch_result"), str):
-                audio_url = upload_result.get("fetch_result")
-            if not audio_url:
-                raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT upload failed. Raw: {upload_result}"))
+                audio_url = None
+                if isinstance(upload_result.get("output"), list) and upload_result["output"]:
+                    audio_url = upload_result["output"][0]
+                if not audio_url and isinstance(upload_result.get("audio_url"), str):
+                    audio_url = upload_result.get("audio_url")
+                if not audio_url and isinstance(upload_result.get("fetch_result"), str):
+                    audio_url = upload_result.get("fetch_result")
+                if not audio_url:
+                    raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT upload failed. Raw: {upload_result}"))
 
-            # 2) Request STT (v6 community endpoint)
-            stt_payload = {
-                "key": modelslab_key,
-                "init_audio": audio_url,
-                "language": "en",
-                "timestamp_level": None,
-                "webhook": None,
-                "track_id": None,
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://modelslab.com/api/v6/voice/speech_to_text",
-                    json=stt_payload,
-                    timeout=120,
-                ) as resp:
-                    resp.raise_for_status()
-                    stt_result = await resp.json()
-                    if stt_result.get("status") == "error":
-                        raise HTTPException(status_code=502, detail=_mask_secret(f"ModelsLab STT Eval Error: {stt_result.get('message', stt_result)}"))
+                # 2) Request STT (v6 community endpoint)
+                stt_payload = {
+                    "key": modelslab_key,
+                    "init_audio": audio_url,
+                    "language": "en",
+                    "timestamp_level": None,
+                    "webhook": None,
+                    "track_id": None,
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://modelslab.com/api/v6/voice/speech_to_text",
+                        json=stt_payload,
+                        timeout=120,
+                    ) as resp:
+                        resp.raise_for_status()
+                        stt_result = await resp.json()
+                        if stt_result.get("status") == "error":
+                            raise HTTPException(status_code=502, detail=_mask_secret(f"ModelsLab STT Eval Error: {stt_result.get('message', stt_result)}"))
 
-            status = stt_result.get("status")
-            if isinstance(status, str) and status.lower() in ["error", "failed"]:
-                raise HTTPException(
-                    status_code=502,
-                    detail=_mask_secret(f"Modelslab STT error: {stt_result.get('message', stt_result)}"),
-                )
+                status = stt_result.get("status")
+                if isinstance(status, str) and status.lower() in ["error", "failed"]:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=_mask_secret(f"Modelslab STT error: {stt_result.get('message', stt_result)}"),
+                    )
 
-            if status == "processing" or stt_result.get("fetch_result"):
-                fetch_url = stt_result.get("fetch_result")
-                if fetch_url:
-                    backoff = 3
-                    last_err = None
-                    for attempt in range(15):
-                        await asyncio.sleep(backoff)
+                if status == "processing" or stt_result.get("fetch_result"):
+                    fetch_url = stt_result.get("fetch_result")
+                    if fetch_url:
+                        backoff = 3
+                        last_err = None
+                        for attempt in range(15):
+                            await asyncio.sleep(backoff)
+                            try:
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.post(fetch_url, json={"key": modelslab_key}, timeout=60) as fresp:
+                                        fresp.raise_for_status()
+                                        stt_result = await fresp.json()
+                                status = stt_result.get("status")
+                                logger.info(f"[STT] fetch_result poll {attempt+1}/15 status={status}")
+                                if isinstance(status, str) and status.lower() in ["error", "failed"]:
+                                    raise HTTPException(
+                                        status_code=502,
+                                        detail=_mask_secret(f"Modelslab STT error: {stt_result.get('message', stt_result)}"),
+                                    )
+                                if status == "success" or "output" in stt_result or "text" in stt_result:
+                                    break
+                            except Exception as fe:
+                                last_err = fe
+                                logger.warning(f"[STT] fetch_result retry failed: {fe}")
+                            backoff = min(backoff * 1.5, 15)
+                        if status != "success" and not stt_result.get("output") and not stt_result.get("text"):
+                            raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT fetch failed: {last_err or 'Timeout'}"))
+
+                transcript = None
+                if isinstance(stt_result.get("output"), list) and stt_result["output"]:
+                    out_val = stt_result["output"][0]
+                    if isinstance(out_val, str) and out_val.startswith("http"):
                         try:
                             async with aiohttp.ClientSession() as session:
-                                async with session.post(fetch_url, json={"key": modelslab_key}, timeout=60) as fresp:
-                                    fresp.raise_for_status()
-                                    stt_result = await fresp.json()
-                            status = stt_result.get("status")
-                            logger.info(f"[STT] fetch_result poll {attempt+1}/15 status={status}")
-                            if isinstance(status, str) and status.lower() in ["error", "failed"]:
-                                raise HTTPException(
-                                    status_code=502,
-                                    detail=_mask_secret(f"Modelslab STT error: {stt_result.get('message', stt_result)}"),
-                                )
-                            if status == "success" or "output" in stt_result or "text" in stt_result:
-                                break
-                        except Exception as fe:
-                            last_err = fe
-                            logger.warning(f"[STT] fetch_result retry failed: {fe}")
-                        backoff = min(backoff * 1.5, 15)
-                    if status != "success" and not stt_result.get("output") and not stt_result.get("text"):
-                        raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT fetch failed: {last_err or 'Timeout'}"))
+                                async with session.get(out_val, timeout=30) as txt_resp:
+                                    txt_resp.raise_for_status()
+                                    transcript = await txt_resp.text()
+                        except Exception as e:
+                            logger.warning(f"Failed to download STT text from {out_val}: {e}")
+                    else:
+                        transcript = out_val
+                if not transcript and isinstance(stt_result.get("output"), str):
+                    transcript = stt_result["output"]
 
-            transcript = None
-            if isinstance(stt_result.get("output"), list) and stt_result["output"]:
-                out_val = stt_result["output"][0]
-                if isinstance(out_val, str) and out_val.startswith("http"):
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(out_val, timeout=30) as txt_resp:
-                                txt_resp.raise_for_status()
-                                transcript = await txt_resp.text()
-                    except Exception as e:
-                        logger.warning(f"Failed to download STT text from {out_val}: {e}")
-                else:
-                    transcript = out_val
-            if not transcript and isinstance(stt_result.get("output"), str):
-                transcript = stt_result["output"]
+                if not transcript and isinstance(stt_result.get("text"), str):
+                    transcript = stt_result["text"]
 
-            if not transcript and isinstance(stt_result.get("text"), str):
-                transcript = stt_result["text"]
-            
-            if not transcript:
-                raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT did not return transcript. Raw: {stt_result}"))
+                if not transcript:
+                    raise HTTPException(status_code=502, detail=_mask_secret(f"Modelslab STT did not return transcript. Raw: {stt_result}"))
 
-            return TranscriptionResponse(transcript=transcript)
+                return TranscriptionResponse(transcript=transcript)
+            except Exception as e:
+                logger.warning(f"[STT] ModelsLab failed; falling back to local STT. Error: {e}")
 
-        # Fallback to local Whisper if ModelsLab key is missing
+        # Fallback to local Whisper if ModelsLab key is missing or failed
         backend = os.getenv("STT_BACKEND", "local").lower()
         if backend == "local":
-            from app.multimodal.stt import SpeechToText
-            engine = SpeechToText()
-            transcript = engine.transcribe(file_bytes, filename=filename)
-            return TranscriptionResponse(transcript=transcript)
+            try:
+                from app.multimodal.stt import SpeechToText
+                engine = SpeechToText()
+                transcript = engine.transcribe(file_bytes, filename=filename)
+                return TranscriptionResponse(transcript=transcript)
+            except Exception as e:
+                logger.warning(f"[STT] Local Whisper failed; falling back to Groq STT. Error: {e}")
 
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
@@ -1450,7 +1480,6 @@ async def transcribe_audio_endpoint(
         import aiohttp
 
         form = aiohttp.FormData()
-        file_bytes = await audio_file.read()
         form.add_field("file", file_bytes, filename=filename, content_type=audio_file.content_type)
         form.add_field("model", "whisper-large-v3-turbo")
         form.add_field("response_format", "json")
@@ -1537,7 +1566,7 @@ class SystemMetricsResponse(BaseModel):
 )
 async def system_metrics_endpoint(x_tenant_id: Optional[str] = Header(default="default", alias="x-tenant-id")):
     import psutil
-    active = len([j for j in ingestion_jobs.values() if j._state.get("status") in ["pending", "crawling_and_extracting", "running", "extracting"]])
+    active = len([j for j in ingestion_jobs.values() if isinstance(j, dict) and j.get("status") in ["pending", "crawling_and_extracting", "running", "extracting"]])
     
     hardware = HardwareMetrics(
         cpu_usage_percent=psutil.cpu_percent(interval=0.1),
@@ -1563,6 +1592,66 @@ async def system_metrics_endpoint(x_tenant_id: Optional[str] = Header(default="d
         tenant_id=x_tenant_id,
         llm_observability=llm_metrics
     )
+
+
+@router.get(
+    "/metrics/sla",
+    tags=["System"],
+    summary="SLA Metrics Export",
+    description="Returns latency and error-rate aggregates from recent audit logs for SLA dashboards."
+)
+async def sla_metrics_endpoint(
+    x_tenant_id: Optional[str] = Header(default="default", alias="x-tenant-id"),
+    limit: int = 200
+):
+    import json
+    import statistics
+    from pathlib import Path
+
+    audit_path = Path("data") / "audit" / "audit_logs.jsonl"
+    if not audit_path.exists():
+        raise HTTPException(status_code=404, detail="Audit log file not found.")
+
+    rows = []
+    with audit_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+
+    rows = rows[-max(1, min(limit, 5000)):]
+    latencies = [r.get("latency_ms", 0.0) for r in rows if isinstance(r.get("latency_ms"), (int, float))]
+    errors = [r for r in rows if (r.get("answer_preview") or "").lower().startswith("error") or r.get("routed_agent") == "unknown"]
+
+    def percentile(values, pct):
+        if not values:
+            return None
+        values = sorted(values)
+        idx = max(0, int(len(values) * pct) - 1)
+        return values[idx]
+
+    by_agent = {}
+    for r in rows:
+        agent = r.get("routed_agent") or "unknown"
+        by_agent.setdefault(agent, 0)
+        by_agent[agent] += 1
+
+    return {
+        "tenant_id": x_tenant_id,
+        "samples": len(rows),
+        "latency_ms": {
+            "avg": round(statistics.mean(latencies), 3) if latencies else None,
+            "p95": percentile(latencies, 0.95),
+            "p99": percentile(latencies, 0.99),
+            "max": max(latencies) if latencies else None,
+        },
+        "error_rate": round(len(errors) / len(rows), 4) if rows else 0.0,
+        "by_agent": by_agent,
+    }
 
 # -----------------------------------------------------------------------------
 # 9. Decoupled Business Analyst Agent Endpoint

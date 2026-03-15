@@ -25,5 +25,30 @@ $env:PYTHONPATH = ""
 $env:PYTHONEXECUTABLE = $py
 $env:PATH = (Join-Path $repo "venv\Scripts") + ";" + $env:PATH
 
+# If local ffmpeg is installed, prepend to PATH for STT in worker.
+$ffmpegRoot = Join-Path $repo "tools\\ffmpeg"
+if (Test-Path $ffmpegRoot) {
+  $ffmpegDir = Get-ChildItem -Path $ffmpegRoot -Directory | Select-Object -First 1
+  if ($ffmpegDir) {
+    $ffmpegBin = Join-Path $ffmpegDir.FullName "bin"
+    if (Test-Path $ffmpegBin) {
+      $env:PATH = "$ffmpegBin;$env:PATH"
+    }
+  }
+}
+
+# Allow a dedicated override for embeddings provider in Celery worker.
+if ($env:CELERY_EMBEDDINGS_PROVIDER) {
+  $env:EMBEDDINGS_PROVIDER = $env:CELERY_EMBEDDINGS_PROVIDER
+}
+
+# Purge any queued tasks so the worker starts fresh.
+try {
+  Write-Host "[CELERY] Purging queued tasks before start..."
+  & $py -m celery -A app.infra.celery_app.celery_app purge -f
+} catch {
+  Write-Host "[CELERY] Purge failed; continuing to start worker. Error: $($_.Exception.Message)"
+}
+
 # Windows-safe pool to avoid WinError 5 with billiard
 & $py -m celery -A app.infra.celery_app.celery_app worker --loglevel=info --pool=solo --concurrency=1

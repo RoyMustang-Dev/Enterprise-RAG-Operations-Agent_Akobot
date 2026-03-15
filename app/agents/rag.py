@@ -89,26 +89,42 @@ class RAGAgent:
         
         return workflow.compile()
         
-    def invoke(self, state: AgentState) -> AgentState:
+    def _build_config(self) -> Dict[str, Any]:
+        config: Dict[str, Any] = {}
+        if os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"):
+            try:
+                from langfuse.callback import CallbackHandler
+                langfuse_handler = CallbackHandler(
+                    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+                    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+                    host=os.getenv("LANGFUSE_HOST", "https://us.langfuse.com"),
+                )
+                config["callbacks"] = [langfuse_handler]
+                logger.info("[LANGFUSE] Tracing enabled for RAG pipeline.")
+            except Exception as e:
+                logger.warning(f"[LANGFUSE] Failed to initialize RAG callback: {e}")
+        return config
+
+    def invoke(self, state: AgentState, config: Dict[str, Any] = None) -> AgentState:
         """
         Executes the compiled LangGraph pipeline.
         """
         logger.info(f"[STAGE:RAG:DAG] Start query={state['query'][:50]}")
         # Deep copy to ensure immutable updates structurally
         try:
-            result = self.graph.invoke(state)
+            result = self.graph.invoke(state, config=config or self._build_config())
         except Exception as e:
             import traceback
             logger.error(f'[RAG AGENT DAG CRASH] {traceback.format_exc()}')
             raise
         return result
         
-    async def ainvoke(self, state: AgentState) -> AgentState:
+    async def ainvoke(self, state: AgentState, config: Dict[str, Any] = None) -> AgentState:
         """
         Executes the compiled LangGraph pipeline non-blockingly inside the asynchronous threadpool bounds.
         """
         logger.info(f"[STAGE:RAG:DAG] Async start query={state['query'][:50]}")
-        result = await self.graph.ainvoke(state)
+        result = await self.graph.ainvoke(state, config=config or self._build_config())
         return result
 
     # -------------------------------------------------------------------------

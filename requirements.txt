@@ -60,7 +60,7 @@ msal
 numpy>=2.0.0
 xgboost>=2.0.0
 xlsxwriter
-scipy
+scipy==1.11.4
 statsmodels
 dowhy
 econml

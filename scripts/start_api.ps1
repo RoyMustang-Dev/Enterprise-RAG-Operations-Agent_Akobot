@@ -29,5 +29,17 @@ $env:PYTHONEXECUTABLE = $py
 $env:PATH = (Join-Path $repo "venv\Scripts") + ";" + $env:PATH
 $env:TORCH_DISABLE_SHM = "1"
 
+# If local ffmpeg is installed, prepend to PATH for STT.
+$ffmpegRoot = Join-Path $repo "tools\\ffmpeg"
+if (Test-Path $ffmpegRoot) {
+  $ffmpegDir = Get-ChildItem -Path $ffmpegRoot -Directory | Select-Object -First 1
+  if ($ffmpegDir) {
+    $ffmpegBin = Join-Path $ffmpegDir.FullName "bin"
+    if (Test-Path $ffmpegBin) {
+      $env:PATH = "$ffmpegBin;$env:PATH"
+    }
+  }
+}
+
 $reload = $env:API_RELOAD -eq "true"
 & $py -c "import os,sys, multiprocessing as mp; os.environ['PYTHONEXECUTABLE']=sys.executable; mp.set_executable(sys.executable); import uvicorn; uvicorn.run('app.main:app', host='0.0.0.0', port=8000, reload=$reload)"

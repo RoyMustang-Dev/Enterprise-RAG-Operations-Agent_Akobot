@@ -38,6 +38,7 @@ class EmbeddingModel:
     def __init__(self, model_name: str = "BAAI/bge-large-en-v1.5"):
         self.model_name = model_name
         self._model = None
+        self.embeddings_provider = (os.getenv("EMBEDDINGS_PROVIDER") or "").strip().lower()
         
         # Phase 14: Cloud Fallback
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -45,6 +46,14 @@ class EmbeddingModel:
         self.gemini_model = "gemini-embedding-001"
         # Keep Qdrant dimension stable (1024). Gemini supports outputDimensionality 128..3072.
         self.gemini_output_dim = 1024
+
+        if self.embeddings_provider in {"local", "cpu", "gpu"}:
+            self.gemini_api_key = None
+            self.openai_api_key = None
+        elif self.embeddings_provider == "gemini":
+            self.openai_api_key = None
+        elif self.embeddings_provider == "openai":
+            self.gemini_api_key = None
         
         # Phase 13: Hardware Probing
         if not self.openai_api_key and not self.gemini_api_key:
@@ -61,6 +70,8 @@ class EmbeddingModel:
                 logger.info("[EMBEDDING ENGINE] Cloud Override -> Routing to Gemini embeddings.")
             else:
                 logger.info("[EMBEDDING ENGINE] Cloud Override -> Routing to OpenAI API text-embedding-3-small.")
+
+        self._max_seq_length = None
         
     @property
     def model(self):
@@ -96,6 +107,43 @@ class EmbeddingModel:
             logger.info(f"Mathematical Model loaded successfully into {self.device} Hardware Context.")
         return self._model
 
+    def _get_max_seq_length(self) -> int:
+        if self._max_seq_length is not None:
+            return self._max_seq_length
+        try:
+            tokenizer = getattr(self.model, "tokenizer", None)
+            max_len = None
+            if tokenizer is not None:
+                max_len = getattr(tokenizer, "model_max_length", None)
+            if not max_len:
+                max_len = getattr(self.model, "max_seq_length", None)
+            if not max_len or max_len <= 0:
+                max_len = 512
+        except Exception:
+            max_len = 512
+        self._max_seq_length = max_len
+        return max_len
+
+    def _truncate_texts(self, texts: List[str]) -> List[str]:
+        tokenizer = getattr(self.model, "tokenizer", None)
+        if tokenizer is None:
+            return texts
+        max_len = self._get_max_seq_length()
+        try:
+            encoded = tokenizer(
+                texts,
+                max_length=max_len,
+                truncation=True,
+                padding=False,
+                return_tensors=None
+            )
+            input_ids = encoded.get("input_ids")
+            if not input_ids:
+                return texts
+            return [tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+        except Exception:
+            return texts
+
     @lru_cache(maxsize=1000)
     def generate_embedding(self, text: str) -> List[float]:
         """
@@ -122,7 +170,14 @@ class EmbeddingModel:
             return response.json()["data"][0]["embedding"]
             
         # TODO Phase 8: Add `normalize_embeddings=True` to enforce perfect L2 Cosine Spheres.
-        embedding = self.model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+        max_len = self._get_max_seq_length()
+        truncated = self._truncate_texts([text])
+        text_to_encode = truncated[0] if truncated else text
+        embedding = self.model.encode(
+            text_to_encode,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
         return embedding.tolist()
 
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
@@ -164,6 +219,7 @@ class EmbeddingModel:
 
         # Phase 13: Hardware Execution Sub-Routing
         if self.device in ["cuda", "mps"]:
+            texts = self._truncate_texts(texts)
             # Native GPU Tensor processing devours entire arrays aggressively
             embeddings = self.model.encode(
                 texts, 
@@ -177,6 +233,7 @@ class EmbeddingModel:
             # Native CPU Single-Core bottleneck aversion
             # Slice sequential arrays across all explicit multicore system boundaries via ThreadPoolExecutor
             def embed_sub_batch(sub_batch):
+                sub_batch = self._truncate_texts(sub_batch)
                 return self.model.encode(
                     sub_batch, 
                     convert_to_numpy=True, 
@@ -248,9 +305,11 @@ class EmbeddingModel:
         params = {"key": self.gemini_api_key}
         batch_size = 32
         all_embeddings: List[List[float]] = []
-        for i in range(0, len(texts), batch_size):
+        i = 0
+        while i < len(texts):
             batch = texts[i:i + batch_size]
             backoff = 1
+            success = False
             for attempt in range(6):
                 payload = {
                     "requests": [
@@ -270,16 +329,20 @@ class EmbeddingModel:
                         backoff = min(backoff * 2, 16)
                         if batch_size > 8:
                             batch_size = max(8, batch_size // 2)
+                            batch = texts[i:i + batch_size]
                         continue
                     response.raise_for_status()
                     embeddings = response.json().get("embeddings", [])
                     for emb in embeddings:
                         values = emb.get("values", [])
                         all_embeddings.append(self._normalize(values))
+                    success = True
                     break
                 except Exception as e:
                     if attempt == 5:
                         self._raise_clean_http_error(e, "Gemini batchEmbedContents failed")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 16)
+            if success:
+                i += len(batch)
         return all_embeddings

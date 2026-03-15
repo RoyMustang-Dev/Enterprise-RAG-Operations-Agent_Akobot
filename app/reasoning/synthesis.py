@@ -32,6 +32,9 @@ class SynthesisEngine:
         phase = get_phase_model("rag_synthesis")
         self.provider = phase["provider"]
         self.model_id = model_override or phase["model"]
+        self.fallback_provider = phase.get("fallback_provider")
+        self.groq_model = os.getenv("RAG_SYNTH_GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.gemini_model = os.getenv("RAG_SYNTH_GEMINI_MODEL", "gemini-2.5-flash")
         
         # Tokenizer initialization for boundary limits
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -47,7 +50,7 @@ class SynthesisEngine:
         stage_info(logger, "RAG:SYNTH", "api_call")
         # 20 second timeout to avoid excessive tail latency on large models
         return chat_completion(
-            provider=self.provider,
+            provider=payload.get("provider", self.provider),
             model=payload["model"],
             messages=payload["messages"],
             temperature=payload.get("temperature", 0.3),
@@ -98,6 +101,7 @@ class SynthesisEngine:
             )
             
         payload = {
+            "provider": self.provider,
             "model": active_model,
             "messages": [
                 {"role": "system", "content": self.system_prompt},
@@ -116,10 +120,39 @@ class SynthesisEngine:
                 answer_text = parsed_result.get("answer", "")
                 confidence = parsed_result.get("confidence", 0.0)
             except Exception:
-                # Fallback: treat raw content as the answer if JSON parsing fails
-                stage_warn(logger, "RAG:SYNTH", "non_json_output_fallback")
-                answer_text = raw_content.strip()
-                confidence = 0.0
+                # Try to extract fenced JSON block or best-effort JSON slice
+                try:
+                    import re as _re
+                    match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_content, _re.DOTALL)
+                    candidate = match.group(1) if match else None
+                    if not candidate:
+                        start = raw_content.find("{")
+                        end = raw_content.rfind("}")
+                        if start != -1 and end != -1 and end > start:
+                            candidate = raw_content[start:end + 1]
+                    if candidate:
+                        parsed_result = json.loads(candidate)
+                        answer_text = parsed_result.get("answer", raw_content.strip())
+                        confidence = parsed_result.get("confidence", 0.0)
+                    else:
+                        raise ValueError("no json candidate")
+                except Exception:
+                    # Last-resort: extract answer field from JSON-ish text.
+                    try:
+                        import re as _re
+                        match = _re.search(r'"answer"\s*:\s*"(.*?)"\s*,\s*"confidence"', raw_content, _re.DOTALL)
+                        if match:
+                            candidate = match.group(1)
+                            candidate = candidate.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"")
+                            answer_text = candidate.strip()
+                            confidence = 0.0
+                        else:
+                            raise ValueError("no answer field")
+                    except Exception:
+                        # Fallback: treat raw content as the answer if JSON parsing fails
+                        stage_warn(logger, "RAG:SYNTH", "non_json_output_fallback")
+                        answer_text = raw_content.strip()
+                        confidence = 0.0
 
             # Approx token counts (input from prompt/context, output from answer text)
             tokens_input = system_overhead + user_prompt_overhead + cost_sum
@@ -137,6 +170,40 @@ class SynthesisEngine:
             
         except Exception as e:
              stage_warn(logger, "RAG:SYNTH", f"crash={e}")
+             # Fallback chain: Groq -> Gemini
+             fallback_chain = []
+             if os.getenv("GROQ_API_KEY") and self.provider != "groq":
+                 fallback_chain.append(("groq", self.groq_model))
+             if os.getenv("GEMINI_API_KEY") and self.provider != "gemini":
+                 fallback_chain.append(("gemini", self.gemini_model))
+             for provider, model in fallback_chain:
+                 try:
+                     stage_warn(logger, "RAG:SYNTH", f"fallback={provider}:{model}")
+                     payload_fb = dict(payload)
+                     payload_fb["provider"] = provider
+                     payload_fb["model"] = model
+                     response_json = self._execute_api_call(payload_fb)
+                     raw_content = response_json["choices"][0]["message"]["content"]
+                     try:
+                         parsed_result = json.loads(raw_content)
+                         answer_text = parsed_result.get("answer", "")
+                         confidence = parsed_result.get("confidence", 0.0)
+                     except Exception:
+                         answer_text = raw_content.strip()
+                         confidence = 0.0
+                     tokens_input = system_overhead + user_prompt_overhead + cost_sum
+                     tokens_output = len(self.tokenizer.encode(answer_text)) if answer_text else 0
+                     return {
+                         "answer": answer_text,
+                         "provenance": provenance,
+                         "confidence": confidence,
+                         "tokens_input": tokens_input,
+                         "tokens_output": tokens_output,
+                         "temperature_used": active_temp,
+                         "model_used": model
+                     }
+                 except Exception as fb_err:
+                     stage_warn(logger, "RAG:SYNTH", f"fallback_crash={fb_err}")
              # Extractive fallback to avoid hard failure
              fallback_bits = []
              for chunk in context_chunks[:3]:
@@ -232,15 +299,62 @@ class SynthesisEngine:
                 answer_text += delta
         except Exception as e:
             stage_warn(logger, "RAG:SYNTH", f"stream_crash={e}")
+            # Fallback streaming to Groq/Gemini if primary fails
+            fallback_chain = []
+            if os.getenv("GROQ_API_KEY") and self.provider != "groq":
+                fallback_chain.append(("groq", self.groq_model))
+            if os.getenv("GEMINI_API_KEY") and self.provider != "gemini":
+                fallback_chain.append(("gemini", self.gemini_model))
+            for provider, model in fallback_chain:
+                try:
+                    async for delta in achat_completion_stream(
+                        provider=provider,
+                        model=model,
+                        messages=payload["messages"],
+                        temperature=payload.get("temperature", 0.3),
+                        max_tokens=payload.get("max_tokens"),
+                        response_format=payload.get("response_format"),
+                        timeout=30,
+                    ):
+                        if delta and on_token:
+                            on_token(delta)
+                        answer_text += delta
+                    break
+                except Exception as fb_err:
+                    stage_warn(logger, "RAG:SYNTH", f"stream_fallback_crash={fb_err}")
 
-        # Parse JSON if possible
+        # Parse JSON if possible (support fenced json blocks)
         confidence = 0.0
         try:
             parsed_result = json.loads(answer_text)
             answer_text = parsed_result.get("answer", "")
             confidence = parsed_result.get("confidence", 0.0)
         except Exception:
-            pass
+            try:
+                import re as _re
+                match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", answer_text, _re.DOTALL)
+                candidate = match.group(1) if match else None
+                if not candidate:
+                    start = answer_text.find("{")
+                    end = answer_text.rfind("}")
+                    if start != -1 and end != -1 and end > start:
+                        candidate = answer_text[start:end + 1]
+                if candidate:
+                    parsed_result = json.loads(candidate)
+                    answer_text = parsed_result.get("answer", answer_text)
+                    confidence = parsed_result.get("confidence", 0.0)
+            except Exception:
+                # Last-resort extraction from JSON-ish stream
+                try:
+                    import re as _re
+                    match = _re.search(r'"answer"\s*:\s*"(.*?)"\s*,\s*"confidence"', answer_text, _re.DOTALL)
+                    if match:
+                        candidate = match.group(1)
+                        candidate = candidate.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"")
+                        answer_text = candidate.strip()
+                        confidence = 0.0
+                except Exception:
+                    pass
 
         tokens_input = system_overhead + user_prompt_overhead + cost_sum
         tokens_output = len(self.tokenizer.encode(answer_text)) if answer_text else 0

@@ -63,6 +63,7 @@ class IngestionPipeline:
         """
         if not file_paths:
             return 0
+        t0 = time.perf_counter()
 
         total_chunks = 0
         all_chunks = []
@@ -211,8 +212,13 @@ class IngestionPipeline:
         if job_tracker is not None and mark_completed:
             job_tracker["status"] = "completed"
             
-        msg = f"Orchestration Ingestion loop complete. Successfully persisted {total_processed} exact chunks."
+        elapsed = time.perf_counter() - t0
+        msg = (
+            "Orchestration Ingestion loop complete. "
+            f"Successfully persisted {total_processed} exact chunks in {elapsed:.2f}s."
+        )
         logger.info(msg)
         if job_tracker is not None:
             job_tracker.setdefault("logs", []).append(msg)
+            job_tracker["ingestion_seconds"] = round(elapsed, 2)
         return total_processed
