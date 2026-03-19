@@ -47,10 +47,13 @@ ensure_qdrant_grpc_compat()
 
 # Import the new Vertical Slice router
 from app.api.routes import router as api_router
+from app.v2.api.routes_v2 import router as api_router_v2
 from app.infra.otel import init_otel
 from app.infra.hardware import HardwareProbe
 from app.infra.model_bootstrap import configure_model_cache, preload_models
 from app.infra.database import cleanup_expired_tenant_dbs, set_current_tenant
+from app.middleware.auth import auth_middleware
+from app.middleware.waf import waf_middleware
 
 # -----------------------------------------------------------------------------
 # FastAPI Application Initialization
@@ -114,6 +117,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Auth and WAF middleware (optional via env flags)
+@app.middleware("http")
+async def waf_guard(request: Request, call_next):
+    return await waf_middleware(request, call_next)
+
+@app.middleware("http")
+async def auth_guard(request: Request, call_next):
+    return await auth_middleware(request, call_next)
+
 # -----------------------------------------------------------------------------
 # Metrics (Prometheus)
 # -----------------------------------------------------------------------------
@@ -134,6 +146,7 @@ REQUEST_LATENCY = Histogram(
 # -----------------------------------------------------------------------------
 # Mount all endpoints under the /api/v1 namespace for versioning compliance
 app.include_router(api_router, prefix="/api/v1")
+app.include_router(api_router_v2, prefix="/api/v2")
 
 # Optional OpenTelemetry bootstrap
 init_otel(app)
@@ -191,7 +204,7 @@ preload_models()
 async def log_requests(request: Request, call_next):
     start = time.perf_counter()
     # Bind tenant context for DB routing/logging
-    tenant_id = request.headers.get("x-tenant-id")
+    tenant_id = getattr(request.state, "tenant_id", None) or request.headers.get("x-tenant-id")
     set_current_tenant(tenant_id)
     try:
         response = await call_next(request)

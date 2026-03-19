@@ -73,11 +73,52 @@ def time_series_forecast_prophet(historical_data: Union[pd.DataFrame, str], peri
         future_forecast.to_csv(os.path.join(export_dir, file_name), index=False)
         
         preview = future_forecast.head(5).to_dict(orient="records")
-        return f"SUCCESS: Forecast computed. Massive dataframe safely bypassed token limit and saved to disk at '/api/v1/exports/{file_name}'. Preview of first 5 days array: {preview}. Backtest MAE={mae:.4f}. CI=±{1.96*std_resid:.4f}"
+        return f"SUCCESS: Forecast computed. Massive dataframe safely bypassed token limit and saved to disk at '/api/v1/exports/{file_name}'. Preview of first 5 days array: {preview}. Backtest MAE={mae:.4f}. CI=+/-{1.96*std_resid:.4f}"
         
     except ImportError:
-        logger.error("[PROPHET FORECAST] Missing Prophet Library.")
-        return "System Architectural Error: The 'prophet' library is not installed in the environment."
+        logger.warning("[PROPHET FORECAST] Prophet not installed. Falling back to linear trend forecast.")
+        try:
+            import numpy as np
+            import json
+            if isinstance(historical_data, str):
+                historical_data = json.loads(historical_data)
+                df = pd.DataFrame(historical_data)
+            elif isinstance(historical_data, pd.DataFrame):
+                df = historical_data.copy()
+            else:
+                return "Fatal Error: 'historical_data' must be a Pandas DataFrame."
+            if 'ds' not in df.columns or 'y' not in df.columns:
+                return "Fatal Error: Data must contain exactly 'ds' (date format) and 'y' (numeric format)."
+            df['ds'] = pd.to_datetime(df['ds'])
+            df['y'] = pd.to_numeric(df['y'])
+            df = df.dropna(subset=['ds', 'y'])
+            df = df.sort_values('ds')
+            if df.empty:
+                return "Fatal Error: No valid data points for forecasting."
+            # Linear trend on ordinal dates
+            x = df['ds'].map(pd.Timestamp.toordinal).to_numpy()
+            y = df['y'].to_numpy()
+            coef = np.polyfit(x, y, 1)
+            last_date = df['ds'].max()
+            future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=periods, freq='D')
+            future_x = future_dates.map(pd.Timestamp.toordinal).to_numpy()
+            yhat = coef[0] * future_x + coef[1]
+            future_forecast = pd.DataFrame({"ds": future_dates, "yhat": yhat})
+            # Backtest MAE and CI
+            yhat_hist = coef[0] * x + coef[1]
+            resid = yhat_hist - y
+            mae = float(np.mean(np.abs(resid))) if len(resid) else 0.0
+            std_resid = float(np.std(resid)) if len(resid) else 0.0
+            import os
+            import uuid
+            export_dir = os.path.join(os.getcwd(), "data", "exports")
+            os.makedirs(export_dir, exist_ok=True)
+            file_name = f"prophet_fallback_forecast_{uuid.uuid4().hex[:8]}.csv"
+            future_forecast.to_csv(os.path.join(export_dir, file_name), index=False)
+            preview = future_forecast.head(5).to_dict(orient="records")
+            return f"SUCCESS: Prophet unavailable; linear trend forecast generated. Saved to '/api/v1/exports/{file_name}'. Preview: {preview}. Backtest MAE={mae:.4f}. CI=+/-{1.96*std_resid:.4f}"
+        except Exception as e:
+            return f"Prophet fallback failed: {e}"
     except Exception as e:
         logger.error(f"[PROPHET FORECAST] Execution Error: {e}")
         return f"Error executing Meta Prophet Forecast: {str(e)}"
@@ -103,15 +144,24 @@ def linear_regression_projection(features_data: pd.DataFrame, target_column: str
             return f"Fatal Error: Target column '{target_column}' missing from provided historical data."
             
         # Separate X (features) and Y (target)
-        X_train = df.drop(columns=[target_column])
-        y_train = df[target_column]
+        X_train_raw = df.drop(columns=[target_column])
+        y_train = pd.to_numeric(df[target_column], errors="coerce")
+        # One-hot encode categorical features for robustness
+        X_train = pd.get_dummies(X_train_raw, drop_first=False)
+        # Align future features with training columns
+        df_future_encoded = pd.get_dummies(df_future, drop_first=False)
+        df_future_encoded = df_future_encoded.reindex(columns=X_train.columns, fill_value=0)
         
         logger.info(f"[SKLEARN REGRESSION] Training Multivariable Regression on {len(X_train.columns)} features.")
         
         model = LinearRegression()
+        # Drop rows with NaN target
+        valid_mask = y_train.notna()
+        X_train = X_train.loc[valid_mask]
+        y_train = y_train.loc[valid_mask]
         model.fit(X_train, y_train)
         
-        predictions = model.predict(df_future)
+        predictions = model.predict(df_future_encoded)
         df_future[f'predicted_{target_column}'] = predictions
         
         import os
@@ -227,7 +277,7 @@ def time_series_forecast_xgboost(historical_data: Union[pd.DataFrame, str], peri
         final_df.to_csv(os.path.join(export_dir, file_name), index=False)
         
         preview = final_df.head(5).to_dict(orient="records")
-        return f"SUCCESS: XGBoost Multi-variate Panel Forecast completed. Heavy payload written seamlessly to CSV at '/api/v1/exports/{file_name}'. Small Preview buffer: {preview}. Backtest MAE={mae:.4f}. CI=±{1.96*std_resid:.4f}"
+        return f"SUCCESS: XGBoost Multi-variate Panel Forecast completed. Heavy payload written seamlessly to CSV at '/api/v1/exports/{file_name}'. Small Preview buffer: {preview}. Backtest MAE={mae:.4f}. CI=+/-{1.96*std_resid:.4f}"
         
     except ImportError:
         logger.error("[XGBOOST FORECAST] Missing XGBoost Library.")

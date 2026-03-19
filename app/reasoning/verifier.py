@@ -25,8 +25,9 @@ class HallucinationVerifier:
     Independent Fact-Checker auditing the draft answer against the raw chunk arrays Line-by-Line.
     """
     
-    def __init__(self, use_sarvam: bool = True):
-        # We target Sarvam explicitly for independence check, but fallback to Groq if keys are missing
+    def __init__(self, use_sarvam: bool = False):
+        # Primary verifier uses ModelsLab Dev Tier (Gemini) for reliability.
+        # Groq is used only as last-resort fallback when ModelsLab is unavailable.
         self.use_sarvam = use_sarvam
         self.sarvam_key = os.getenv("SARVAM_API_KEY")
         self.groq_key = os.getenv("GROQ_API_KEY")
@@ -46,13 +47,13 @@ class HallucinationVerifier:
         context_block = "\n\n---\n\n".join([c.get("page_content", "") for c in context_chunks])
         user_payload = f"DRAFT_ANSWER: {draft_answer}\n\nCONTEXT_CHUNKS:\n{context_block}"
         
-        # Determine Routing Path (Prefer Sarvam)
+        # Determine Routing Path (Prefer ModelsLab)
         if os.getenv("MODELSLAB_API_KEY"):
-             return self._invoke_modelslab(user_payload)
+            return self._invoke_modelslab(user_payload)
         if self.use_sarvam and self.sarvam_key:
-             return self._invoke_sarvam(user_payload)
-        elif self.groq_key:
-             return self._invoke_groq_fallback(user_payload)
+            return self._invoke_sarvam(user_payload)
+        if self.groq_key:
+            return self._invoke_groq_fallback(user_payload)
              
         # Scaffold Fallback
         return {"overall_verdict": "UNVERIFIED", "score": 0.0, "is_hallucinated": False, "claims": []}
@@ -74,7 +75,8 @@ class HallucinationVerifier:
             stage_info(logger, "RAG:VERIFY", "groq_fallback=true")
             response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=12)
             response.raise_for_status()
-            return json.loads(response.json()["choices"][0]["message"]["content"])
+            raw = response.json()["choices"][0]["message"]["content"]
+            return self._normalize_output(raw)
         except Exception as e:
             stage_warn(logger, "RAG:VERIFY", f"fallback_error={e}")
             return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}
@@ -95,11 +97,9 @@ class HallucinationVerifier:
                 timeout=20,
             )
             raw = data["choices"][0]["message"]["content"]
-            return json.loads(raw)
+            return self._normalize_output(raw)
         except Exception as e:
             stage_warn(logger, "RAG:VERIFY", f"modelslab_error={e}")
-            if self.use_sarvam and self.sarvam_key:
-                return self._invoke_sarvam(payload_str)
             if self.groq_key:
                 return self._invoke_groq_fallback(payload_str)
             return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}
@@ -129,9 +129,39 @@ class HallucinationVerifier:
             elif "```" in raw_text:
                 raw_text = raw_text.split("```")[1].strip()
                 
-            return json.loads(raw_text)
+            return self._normalize_output(raw_text)
         except Exception as e:
             stage_warn(logger, "RAG:VERIFY", f"sarvam_error={e} fallback_to_groq=true")
             if self.groq_key:
                 return self._invoke_groq_fallback(payload_str)
             return {"overall_verdict": "ERROR", "score": 0.0, "is_hallucinated": False, "claims": []}
+
+    def _normalize_output(self, raw_text: str) -> Dict[str, Any]:
+        """
+        Normalizes verifier JSON to the internal schema:
+        {overall_verdict, score, is_hallucinated, claims}
+        """
+        try:
+            cleaned = raw_text or ""
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned:
+                cleaned = cleaned.split("```")[1].strip()
+            data = json.loads(cleaned)
+        except Exception:
+            return {"overall_verdict": "UNVERIFIED", "score": 0.0, "is_hallucinated": False, "claims": []}
+
+        # Support both {"hallucinated": bool, "unsupported_claims": []} and native schema
+        hallucinated = data.get("hallucinated")
+        if hallucinated is None:
+            hallucinated = data.get("is_hallucinated", False)
+        claims = data.get("unsupported_claims") or data.get("claims") or []
+        verdict = data.get("overall_verdict")
+        if not verdict:
+            verdict = "UNSUPPORTED" if hallucinated else "SUPPORTED"
+        return {
+            "overall_verdict": verdict,
+            "score": float(data.get("score", 0.0) or 0.0),
+            "is_hallucinated": bool(hallucinated),
+            "claims": claims,
+        }

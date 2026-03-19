@@ -44,6 +44,9 @@ class DeterministicPandasEngine:
             
             # Sanitize markdown formatting if the LLM hallucinated code blocks
             code = python_code_string.replace("```python", "").replace("```", "").strip()
+            # Patch deprecated pandas resample alias
+            code = code.replace(".resample('M')", ".resample('ME')")
+            code = code.replace('.resample(\"M\")', '.resample(\"ME\")')
             
             # Execute the code against the injected DataFrame mathematically
             result = self.repl.invoke(code)

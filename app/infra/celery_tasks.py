@@ -151,3 +151,115 @@ def run_crawler_job(job_id: str, url: str, max_depth: int, save_folder: str, mod
         tracker["error"] = str(e)
         tracker["logs"].append(f"Celery crawler failed: {e}")
         logger.error(f"[CELERY] Crawler failed: {e}")
+
+
+# -----------------------------------------------------------------------------
+# V2 Ingestion Tasks (PageIndex Tree Builders)
+# -----------------------------------------------------------------------------
+@celery_app.task(name="ingestion.run_files_v2")
+def run_ingestion_files_v2(job_id: str, file_paths: list, tenant_id: str = None):
+    tracker = JobTracker(job_id, {
+        "status": "pending",
+        "job_id": job_id,
+        "logs": ["Celery V2 task started for PageIndex File extraction."],
+    })
+    try:
+        import asyncio
+        import sys
+        
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        from app.v2.ingestion.file_upload_v2 import FileUploadServiceV2
+        # Mock UploadFile functionality for local paths
+        class MockUploadFile:
+            def __init__(self, path):
+                self.filename = os.path.basename(path)
+                self.path = path
+            async def read(self):
+                with open(self.path, "rb") as f:
+                    return f.read()
+
+        sv = FileUploadServiceV2(tenant_id=tenant_id)
+        files = [MockUploadFile(p) for p in file_paths]
+        
+        result = loop.run_until_complete(sv.process_files(files))
+        loop.close()
+        
+        tracker["status"] = "completed"
+        tracker["logs"].append(f"V2 Extraction Complete: {len(result)} files processed for PageIndex.")
+    except Exception as e:
+        tracker["status"] = "failed"
+        tracker["error"] = str(e)
+        logger.error(f"[CELERY V2] File ingestion failed: {e}")
+
+@celery_app.task(name="ingestion.run_crawler_v2")
+def run_crawler_job_v2(job_id: str, url: str, max_depth: int, session_id: str, tenant_id: str = None):
+    tracker = JobTracker(job_id, {
+        "status": "pending",
+        "job_id": job_id,
+        "logs": [f"Celery V2 crawler started for URL: {url}"],
+    })
+    try:
+        from app.infra.database import upsert_ingestion_job
+        from app.v2.retrieval.pageindex_tool import store_documents_in_tree_cache
+        import asyncio
+        import sys
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        from app.v2.ingestion.crawler_v2 import CrawlerService as CrawlerServiceV2
+        crawler = CrawlerServiceV2(tenant_id=tenant_id)
+        
+        from urllib.parse import urlparse as _urlparse
+        _domain = _urlparse(url).netloc or "unknown"
+        _t = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in (tenant_id or "global"))[:64] or "global"
+        _save_folder = os.path.join("data", "crawled_docs_v2", _t, _domain)
+        os.makedirs(_save_folder, exist_ok=True)
+
+        result = loop.run_until_complete(
+            crawler.crawl_url(
+                url=url,
+                save_folder=_save_folder,
+                simulate=False,
+                recursive=(max_depth > 1),
+                max_depth=max_depth,
+            )
+        )
+        loop.close()
+        docs = [
+            {"filename": r.get("url", "page"), "content": r.get("content", "")}
+            for r in crawler.results_memory
+            if r.get("status") == "success"
+        ]
+        node_count = store_documents_in_tree_cache(session_id=session_id, documents=docs, tenant_id=tenant_id)
+        tracker["status"] = "completed"
+        tracker["logs"].append(f"V2 Crawler extracted {len(docs)} pages into {node_count} nodes.")
+        upsert_ingestion_job(
+            job_id=job_id,
+            status="completed",
+            payload={
+                "message": f"V2 crawler indexed {len(docs)} pages into {node_count} nodes.",
+                "session_id": session_id,
+                "nodes_indexed": node_count,
+            },
+            tenant_id=tenant_id,
+        )
+    except Exception as e:
+        tracker["status"] = "failed"
+        tracker["error"] = str(e)
+        try:
+            from app.infra.database import upsert_ingestion_job
+            upsert_ingestion_job(
+                job_id=job_id,
+                status="failed",
+                payload={"message": str(e), "session_id": session_id},
+                tenant_id=tenant_id,
+            )
+        except Exception:
+            pass
+        logger.error(f"[CELERY V2] Crawler failed: {e}")

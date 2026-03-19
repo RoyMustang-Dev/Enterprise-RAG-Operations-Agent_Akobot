@@ -127,6 +127,7 @@ def load_forecast_dataframe(forecast_csv_url: str) -> pd.DataFrame:
 def build_forecast_table(
     forecast_df: pd.DataFrame,
     metric_label: str = "units_sold",
+    ci_width: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if forecast_df.empty:
@@ -134,26 +135,32 @@ def build_forecast_table(
     if "unique_id" in forecast_df.columns:
         for _, r in forecast_df.iterrows():
             region, product = _parse_unique_id(str(r.get("unique_id", "")))
+            forecast_val = float(r.get("y_forecast", 0.0))
+            lower_ci = forecast_val - ci_width if isinstance(ci_width, (int, float)) else None
+            upper_ci = forecast_val + ci_width if isinstance(ci_width, (int, float)) else None
             rows.append({
                 "region": region,
                 "product": product,
                 "date": str(r.get("ds", ""))[:10],
                 "metric": metric_label,
-                "forecast_value": float(r.get("y_forecast", 0.0)),
-                "lower_ci": None,
-                "upper_ci": None
+                "forecast_value": forecast_val,
+                "lower_ci": lower_ci,
+                "upper_ci": upper_ci
             })
         return rows
     if "ds" in forecast_df.columns and "yhat" in forecast_df.columns:
         for _, r in forecast_df.iterrows():
+            forecast_val = float(r.get("yhat", 0.0))
+            lower_ci = forecast_val - ci_width if isinstance(ci_width, (int, float)) else None
+            upper_ci = forecast_val + ci_width if isinstance(ci_width, (int, float)) else None
             rows.append({
                 "region": "All",
                 "product": "All",
                 "date": str(r.get("ds", ""))[:10],
                 "metric": metric_label,
-                "forecast_value": float(r.get("yhat", 0.0)),
-                "lower_ci": None,
-                "upper_ci": None
+                "forecast_value": forecast_val,
+                "lower_ci": lower_ci,
+                "upper_ci": upper_ci
             })
     return rows
 

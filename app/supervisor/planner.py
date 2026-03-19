@@ -13,6 +13,7 @@ class AdaptivePlanner:
 
     def generate_plan(self, state: Dict[str, Any]) -> Dict[str, Any]:
         intent = state.get("intent") or "rag_question"
+        intents = (state.get("optimizations", {}) or {}).get("intents") or [intent]
         complexity = float(state.get("optimizations", {}).get("complexity_score", 0.0))
         query = (state.get("query") or "").lower()
         tenant_id = state.get("tenant_id")
@@ -33,12 +34,23 @@ class AdaptivePlanner:
             effort = "low"
 
         # Route selection
-        if intent == "out_of_scope":
+        if "out_of_scope" in intents:
             route = "out_of_scope"
             run_rewriter = False
-        elif intent in ["greeting", "smalltalk"]:
+        elif any(i in ["greeting", "smalltalk"] for i in intents):
             route = "smalltalk"
             run_rewriter = False
+        elif "crm_request" in intents:
+            route = "support_da"
+            run_rewriter = True
+        elif "email_request" in intents:
+            # If there is a primary RAG intent plus email, still run RAG and handle email after.
+            if any(i in ["rag_question", "code_request", "analytics_request"] for i in intents):
+                route = "rag_agent"
+                run_rewriter = True
+            else:
+                route = "support_da"
+                run_rewriter = True
         elif intent in ["code_request", "analytics_request"]:
             if should_force_rag:
                 route = "rag_agent"

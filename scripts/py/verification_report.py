@@ -11,6 +11,16 @@ def write_section(lines, title, body_lines):
     lines.append("")
 
 
+def extract_email_action(resp):
+    if resp is None:
+        return None
+    try:
+        payload = resp.json()
+        return payload.get("email_action")
+    except Exception:
+        return None
+
+
 def main():
     base = "http://localhost:8000/api/v1"
     headers = {"x-tenant-id": "aditya-ds"}
@@ -173,7 +183,189 @@ def main():
             ],
         )
 
-    # 6) SLA Metrics snapshot
+    # 6) RAG email connect link -> Done -> retry
+    rag_email_query = (
+        "Summarize the sources and send email to adityamishra0996@gmail.com "
+        "subject: RAG Summary body: Please send the summary."
+    )
+    rag_email_resp = None
+    rag_email_err = None
+    try:
+        t0 = time.time()
+        rag_email_resp = requests.post(
+            f"{base}/chat",
+            headers=headers,
+            json={"query": rag_email_query, "session_id": "rag-email-verify"},
+            timeout=120,
+        )
+        rag_email_time = round(time.time() - t0, 2)
+    except Exception as e:
+        rag_email_time = round(time.time() - t0, 2)
+        rag_email_err = str(e)
+    write_section(
+        report_lines,
+        "RAG Email Intent",
+        [
+            f"- query: {rag_email_query}",
+            f"- status: {rag_email_resp.status_code if rag_email_resp else 'error'}",
+            f"- time_s: {rag_email_time}",
+            f"- email_action: {json.dumps(extract_email_action(rag_email_resp), ensure_ascii=False)}",
+            f"- response: {(rag_email_resp.text[:1200] if rag_email_resp else rag_email_err)}",
+        ],
+    )
+
+    rag_done_resp = None
+    rag_done_err = None
+    try:
+        t0 = time.time()
+        rag_done_resp = requests.post(
+            f"{base}/chat",
+            headers=headers,
+            json={"query": "Done", "session_id": "rag-email-verify"},
+            timeout=120,
+        )
+        rag_done_time = round(time.time() - t0, 2)
+    except Exception as e:
+        rag_done_time = round(time.time() - t0, 2)
+        rag_done_err = str(e)
+    write_section(
+        report_lines,
+        "RAG Email Done Retry",
+        [
+            "- query: Done",
+            f"- status: {rag_done_resp.status_code if rag_done_resp else 'error'}",
+            f"- time_s: {rag_done_time}",
+            f"- email_action: {json.dumps(extract_email_action(rag_done_resp), ensure_ascii=False)}",
+            f"- response: {(rag_done_resp.text[:1200] if rag_done_resp else rag_done_err)}",
+        ],
+    )
+
+    # 7) BA email intent + Done retry
+    if ba_dataset.exists():
+        ba_email_query = (
+            "Find top product by revenue by region and forecast next 30 days. "
+            "Send email to adityamishra0996@gmail.com subject: BA Summary body: Please send the BA summary."
+        )
+        ba_email_resp = None
+        ba_email_err = None
+        try:
+            with ba_dataset.open("rb") as f:
+                files = {"files": (ba_dataset.name, f, "text/csv")}
+                data = {"query": ba_email_query, "session_id": "ba-email-verify"}
+                t0 = time.time()
+                ba_email_resp = requests.post(
+                    f"{base}/business_analyst/chat",
+                    headers=headers,
+                    files=files,
+                    data=data,
+                    timeout=180,
+                )
+                ba_email_time = round(time.time() - t0, 2)
+        except Exception as e:
+            ba_email_time = round(time.time() - t0, 2)
+            ba_email_err = str(e)
+        write_section(
+            report_lines,
+            "BA Email Intent",
+            [
+                f"- dataset: {ba_dataset}",
+                f"- query: {ba_email_query}",
+                f"- status: {ba_email_resp.status_code if ba_email_resp else 'error'}",
+                f"- time_s: {ba_email_time}",
+                f"- email_action: {json.dumps(extract_email_action(ba_email_resp), ensure_ascii=False)}",
+                f"- response: {(ba_email_resp.text[:1200] if ba_email_resp else ba_email_err)}",
+            ],
+        )
+
+        ba_done_resp = None
+        ba_done_err = None
+        try:
+            with ba_dataset.open("rb") as f:
+                files = {"files": (ba_dataset.name, f, "text/csv")}
+                data = {"query": "Done", "session_id": "ba-email-verify"}
+                t0 = time.time()
+                ba_done_resp = requests.post(
+                    f"{base}/business_analyst/chat",
+                    headers=headers,
+                    files=files,
+                    data=data,
+                    timeout=180,
+                )
+                ba_done_time = round(time.time() - t0, 2)
+        except Exception as e:
+            ba_done_time = round(time.time() - t0, 2)
+            ba_done_err = str(e)
+        write_section(
+            report_lines,
+            "BA Email Done Retry",
+            [
+                "- query: Done",
+                f"- status: {ba_done_resp.status_code if ba_done_resp else 'error'}",
+                f"- time_s: {ba_done_time}",
+                f"- email_action: {json.dumps(extract_email_action(ba_done_resp), ensure_ascii=False)}",
+                f"- response: {(ba_done_resp.text[:1200] if ba_done_resp else ba_done_err)}",
+            ],
+        )
+
+    # 8) Support DA CRM + BA + Email
+    support_query = (
+        "Use CRM to find any open tickets for customer email adityamishra0996@gmail.com "
+        "and summarize. Send email to adityamishra0996@gmail.com subject: Support Summary body: Please send the summary."
+    )
+    support_headers = {"x-tenant-id": "aditya-ds-crm-test"}
+    support_resp = None
+    support_err = None
+    try:
+        t0 = time.time()
+        support_resp = requests.post(
+            f"{base}/support_data_analytics/chat",
+            headers=support_headers,
+            data={"query": support_query, "session_id": "support-da-verify"},
+            timeout=180,
+        )
+        support_time = round(time.time() - t0, 2)
+    except Exception as e:
+        support_time = round(time.time() - t0, 2)
+        support_err = str(e)
+    write_section(
+        report_lines,
+        "Support DA CRM + Email",
+        [
+            f"- query: {support_query}",
+            f"- status: {support_resp.status_code if support_resp else 'error'}",
+            f"- time_s: {support_time}",
+            f"- email_action: {json.dumps(extract_email_action(support_resp), ensure_ascii=False)}",
+            f"- response: {(support_resp.text[:1200] if support_resp else support_err)}",
+        ],
+    )
+
+    support_done_resp = None
+    support_done_err = None
+    try:
+        t0 = time.time()
+        support_done_resp = requests.post(
+            f"{base}/support_data_analytics/chat",
+            headers=support_headers,
+            data={"query": "Done", "session_id": "support-da-verify"},
+            timeout=120,
+        )
+        support_done_time = round(time.time() - t0, 2)
+    except Exception as e:
+        support_done_time = round(time.time() - t0, 2)
+        support_done_err = str(e)
+    write_section(
+        report_lines,
+        "Support DA Done Retry",
+        [
+            "- query: Done",
+            f"- status: {support_done_resp.status_code if support_done_resp else 'error'}",
+            f"- time_s: {support_done_time}",
+            f"- email_action: {json.dumps(extract_email_action(support_done_resp), ensure_ascii=False)}",
+            f"- response: {(support_done_resp.text[:1200] if support_done_resp else support_done_err)}",
+        ],
+    )
+
+    # 9) SLA Metrics snapshot
     t0 = time.time()
     sla_resp = None
     sla_err = None

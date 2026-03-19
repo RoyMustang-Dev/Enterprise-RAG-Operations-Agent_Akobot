@@ -1,0 +1,60 @@
+"""
+V2 Modular Tool-Calling Orchestrator (Full V1 Feature Parity)
+
+Drives the V2 RAG pipeline via LLM Tool Calling using ModelsLab (gemini-2.5-flash)
+as the primary brain, with Groq llama-3.3-70b as fallback.
+
+Tool Manifest (Full V1 RAG phases as tools):
+  - check_security          → PromptInjectionGuard (Llama Guard)
+  - rewrite_query           → PromptRewriter
+  - search_pageindex        → PageIndex Tree Retrieval (session-scoped)
+  - synthesize_answer       → SynthesisEngine (A/B MoE, token budget) — V1 Phase 5
+  - verify_answer           → HallucinationVerifier (ModelsLab→Groq) — V1 Phase 5
+  - process_image           → VisionModel + FileParser OCR — V1 Multimodal
+  - get_email_or_send       → Composio Gmail (returns connect URL if not authorized)
+
+Enterprise Design:
+  - ModelsLab gemini-2.5-flash as primary brain (paid Dev Tier key)
+  - Groq llama-3.3-70b as fallback
+  - Langfuse tracing via langfuse.openai drop-in (tagged by LANGFUSE_AGENT_TAG)
+  - Full hallucination correction loop (same as V1)
+  - Per-tenant data isolation at every layer
+  - Graceful error handling for all failure modes
+"""
+import os
+import json
+import re
+import logging
+import time
+import uuid
+import asyncio
+from typing import Dict, Any, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Langfuse-aware OpenAI client factory
+# ---------------------------------------------------------------------------
+def _make_async_client(agent_tag: str = "rag_v2"):
+    """
+    Returns an AsyncOpenAI-compatible client.
+    Primary brain: Gemini (OpenAI-compat endpoint, supports tool_calling, generous free tier)
+    Fallback 1: ModelsLab gemini-2.5-flash  
+    Fallback 2: Groq llama-3.3-70b-versatile
+    """
+    tag = os.getenv("LANGFUSE_AGENT_TAG", agent_tag)
+    langfuse_ok = bool(
+        os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")
+    )
+
+    modelslab_key = os.getenv("MODELSLAB_API_KEY")
+    groq_key = os.getenv("GROQ_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+
+    # Priority: ModelsLab Dev Tier → Groq → OpenAI
+    if modelslab_key:
+        api_key = modelslab_key
+        # ModelsLab v6 OpenAI-compat base — SDK appends /chat/completions automatically
+        base_url = "https://modelslab.com/api/v6/llm"
+        primary_provider = "modelslab"
+    elif groq_key:

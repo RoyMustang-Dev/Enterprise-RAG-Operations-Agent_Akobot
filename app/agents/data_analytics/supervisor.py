@@ -15,8 +15,11 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 
 from app.agents.data_analytics.pandas_engine import DeterministicPandasEngine
 from app.agents.data_analytics.tools.rag_wrapper import enterprise_rag_tool
+from app.tools.emailer import send_email_via_composio
+from app.integrations.composio_tool_router import ComposioToolRouterClient
 from app.agents.data_analytics.tools.third_party import google_analytics_4_tool, salesforce_soql_tool, google_sheets_tool, stripe_financial_tool, power_bi_analytics_tool
 from app.infra.model_registry import get_phase_model
+from app.infra.llm_client import set_agent_context
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +232,59 @@ class DataAnalyticsSupervisor:
             name="linear_regression_projection",
             description="Use for multi-variate continuous prediction. Run execute_pandas_math to create your feature dataframe first, then pass its variable name here."
         )
+
+        def _email_wrapper(user_id: str, to: List[str], subject: str, body: str) -> Dict[str, Any]:
+            return send_email_via_composio(user_id=user_id, to=to, subject=subject, body=body)
+
+        email_tool = StructuredTool.from_function(
+            func=_email_wrapper,
+            name="send_email",
+            description="Send an email via Composio. Provide user_id, list of recipients, subject, and body."
+        )
+
+        # Composio tool router wrappers for CRM and other toolkits
+        def _composio_search(user_id: str, use_case: str) -> Dict[str, Any]:
+            client = ComposioToolRouterClient()
+            if not client.is_configured():
+                return {"error": "Composio not configured"}
+            session = client.create_session(user_id=user_id)
+            if not session or not session.get("session_id"):
+                return {"error": "Failed to create Composio session"}
+            return client.search_tools(session["session_id"], use_case)
+
+        def _composio_manage_connections(user_id: str, toolkit: str) -> Dict[str, Any]:
+            client = ComposioToolRouterClient()
+            if not client.is_configured():
+                return {"error": "Composio not configured"}
+            session = client.create_session(user_id=user_id)
+            if not session or not session.get("session_id"):
+                return {"error": "Failed to create Composio session"}
+            return client.create_link(session["session_id"], toolkit)
+
+        def _composio_execute(user_id: str, tool_slug: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+            client = ComposioToolRouterClient()
+            if not client.is_configured():
+                return {"error": "Composio not configured"}
+            session = client.create_session(user_id=user_id)
+            if not session or not session.get("session_id"):
+                return {"error": "Failed to create Composio session"}
+            return client.execute_tool(session["session_id"], tool_slug, arguments)
+
+        composio_search_tool = StructuredTool.from_function(
+            func=_composio_search,
+            name="composio_search_tools",
+            description="Search Composio tools by use case. Returns tool suggestions and connection status."
+        )
+        composio_manage_tool = StructuredTool.from_function(
+            func=_composio_manage_connections,
+            name="composio_manage_connections",
+            description="Generate a connect link for a toolkit (e.g., hubspot, salesforce)."
+        )
+        composio_execute_tool = StructuredTool.from_function(
+            func=_composio_execute,
+            name="composio_execute_tool",
+            description="Execute a Composio tool by slug with arguments after connection."
+        )
         
         self.tools = [
             enterprise_rag_tool, 
@@ -240,7 +296,11 @@ class DataAnalyticsSupervisor:
             salesforce_soql_tool,
             google_sheets_tool,
             power_bi_analytics_tool,
-            stripe_financial_tool
+            stripe_financial_tool,
+            email_tool,
+            composio_search_tool,
+            composio_manage_tool,
+            composio_execute_tool
         ]
         self.llm_with_tools = self.llm.bind_tools(self.tools)
         
@@ -369,7 +429,14 @@ class DataAnalyticsSupervisor:
             intent_metrics = (state.get("intent_payload") or {}).get("metrics") or []
             if intent_metrics:
                 metric_label = intent_metrics[0]
-            table = build_forecast_table(forecast_df, metric_label=metric_label)
+            ci_width = None
+            bounds = (state.get("deterministic_forecast_meta") or {}).get("confidence_bounds")
+            if isinstance(bounds, str) and bounds.strip():
+                try:
+                    ci_width = float(bounds.replace("+/-", "").replace("±", "").strip())
+                except Exception:
+                    ci_width = None
+            table = build_forecast_table(forecast_df, metric_label=metric_label, ci_width=ci_width)
             summaries = compute_per_region_summaries(table)
             return {
                 "deterministic_forecast_table": table,
@@ -916,7 +983,14 @@ class DataAnalyticsSupervisor:
                     explain["mae"] = float(mae_match.group(1))
             forecast_df = load_forecast_dataframe(meta.get("forecast_csv_url", ""))
             metric_label = metric_col.lower()
-            table = build_forecast_table(forecast_df, metric_label=metric_label)
+            ci_width = None
+            bounds = meta.get("confidence_bounds")
+            if isinstance(bounds, str) and bounds.strip():
+                try:
+                    ci_width = float(bounds.replace("+/-", "").replace("±", "").strip())
+                except Exception:
+                    ci_width = None
+            table = build_forecast_table(forecast_df, metric_label=metric_label, ci_width=ci_width)
             summaries = compute_per_region_summaries(table)
             return {
                 "deterministic_forecast_meta": meta,
@@ -1113,6 +1187,8 @@ CRITICAL RULES:
 4. STRICT CHAIN OF THOUGHT: NEVER nest a tool call. You MUST call 'execute_pandas_math' first to calculate your table, wait for the observation, and ONLY THEN pass the exact string variable name of your table into the forecasting tools.
 5. IF using XGBoost for multivariate panel forecasting (e.g. multiple regions), you MUST construct a string column named `unique_id` in your dataframe first (e.g., `df_project['unique_id'] = df_project['Region'] + '_' + df_project['Product_Category']`).
 6. Do not stop until all KPI numbers are 100% computed.
+7. If the user explicitly asks to send email, call `send_email` once with user_id, recipients, subject, and body.
+8. For CRM-related requests (hubspot/salesforce/zendesk), call `composio_search_tools` or `composio_manage_connections` to provide a connect link.
 
 SCHEMA MAP REVEALED:
 {state['df_schema']}
@@ -1565,12 +1641,13 @@ ANALYSIS RESULTS:
         )
         return {"dashboard_json": fallback.model_dump()}
 
-    async def run(self, query: str, persona: str, session_id: str) -> Dict[str, Any]:
+    async def run(self, query: str, persona: str, session_id: str, tenant_id: str | None = None) -> Dict[str, Any]:
         """Entrypoint for the API Route execution."""
+        set_agent_context("ba")
         from app.infra.database import init_analytics_memory_db, fetch_analytics_memory, insert_analytics_memory
-        init_analytics_memory_db()
+        init_analytics_memory_db(tenant_id)
         # Load prior memory for multi-turn context
-        memory_rows = fetch_analytics_memory(session_id=session_id, limit=6)
+        memory_rows = fetch_analytics_memory(session_id=session_id, limit=6, tenant_id=tenant_id)
         memory_messages = []
         for role, content, kpi_json in memory_rows:
             if role == "user":
@@ -1631,9 +1708,15 @@ ANALYSIS RESULTS:
                 timeout=120.0
             )
             # Persist memory
-            insert_analytics_memory(session_id, "user", query, "")
+            insert_analytics_memory(session_id, "user", query, "", tenant_id=tenant_id)
             if final_state.get("dashboard_json"):
-                insert_analytics_memory(session_id, "assistant", json.dumps(final_state["dashboard_json"])[:5000], json.dumps(final_state["dashboard_json"].get("kpi_cards", []))[:2000])
+                insert_analytics_memory(
+                    session_id,
+                    "assistant",
+                    json.dumps(final_state["dashboard_json"])[:5000],
+                    json.dumps(final_state["dashboard_json"].get("kpi_cards", []))[:2000],
+                    tenant_id=tenant_id
+                )
             return final_state["dashboard_json"]
             
         except asyncio.TimeoutError:

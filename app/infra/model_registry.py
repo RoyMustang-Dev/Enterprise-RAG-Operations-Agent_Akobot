@@ -20,7 +20,7 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "intent_classifier_escalation": {
         "provider": "modelslab",
-        "fallback_provider": "gemini",
+        "fallback_provider": "groq",
         "model": "gemini-2.5-flash",
         "temperature": 0.1,
         "max_tokens": 200,
@@ -34,14 +34,14 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "source_scope_classifier_escalation": {
         "provider": "modelslab",
-        "fallback_provider": "gemini",
+        "fallback_provider": "groq",
         "model": "gemini-2.5-flash",
         "temperature": 0.1,
         "max_tokens": 200,
     },
     "security_guard": {
-        "provider": "groq",
-        "fallback_provider": "gemini",
+        "provider": "modelslab",
+        "fallback_provider": None,
         "model": "llama-3.1-8b-instant",
         "temperature": 0.0,
         "max_tokens": 20,
@@ -49,8 +49,8 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
 
     # Query rewrite / extraction / scoring
     "query_rewriter": {
-        "provider": "groq",
-        "fallback_provider": "modelslab",
+        "provider": "modelslab",
+        "fallback_provider": None,
         "model": "llama-3.1-8b-instant",
         "temperature": 0.1,
         "max_tokens": 900,
@@ -80,7 +80,7 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "rag_synthesis": {
         "provider": "modelslab",
-        "fallback_provider": "gemini",
+        "fallback_provider": "groq",
         "model": "gemini-2.5-flash",
         "model_vision": "gemini-3-pro-image-preview",
         "temperature": 0.1,
@@ -88,7 +88,7 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "coder_agent": {
         "provider": "modelslab",
-        "fallback_provider": "gemini",
+        "fallback_provider": "groq",
         "model": "qwen-qwen-2.5-coder-32b-instruct",
         "temperature": 0.1,
         "max_tokens": 1200,
@@ -101,9 +101,9 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
         "max_tokens": 200,
     },
     "hallucination_verifier": {
-        "provider": "groq",
-        "fallback_provider": "gemini",
-        "model": "llama-3.3-70b-versatile",
+        "provider": "modelslab",
+        "fallback_provider": "groq",
+        "model": "gemini-2.5-flash",
         "temperature": 0.0,
         "max_tokens": 600,
     },
@@ -116,7 +116,7 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "bootstrapper": {
         "provider": "modelslab",
-        "fallback_provider": "gemini",
+        "fallback_provider": "groq",
         "model": "gemini-2.5-flash",
         "temperature": 0.2,
         "max_tokens": 1200,
@@ -132,9 +132,11 @@ def get_phase_model(phase: str) -> Dict[str, Any]:
     fallback = cfg.get("fallback_provider")
 
     if provider == "modelslab" and not os.getenv("MODELSLAB_API_KEY"):
-        if fallback == "gemini" and os.getenv("GEMINI_API_KEY"):
-            cfg["provider"] = "gemini"
+        cfg["provider"] = fallback or "groq"
+    if provider == "gemini" and not os.getenv("GEMINI_API_KEY"):
+        if os.getenv("MODELSLAB_API_KEY"):
+            cfg["provider"] = "modelslab"
         else:
-            cfg["provider"] = "groq"
+            cfg["provider"] = fallback or "groq"
 
     return cfg

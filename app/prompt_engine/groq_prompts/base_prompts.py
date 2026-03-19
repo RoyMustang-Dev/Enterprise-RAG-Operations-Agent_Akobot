@@ -5,9 +5,28 @@ These are injected dynamically with the Universal Persona and Few-Shots at runti
 """
 
 GROQ_BASE_PROMPTS = {
-    "intent_classifier": '''SYSTEM: You are a high-precision intent classifier. Given the user message, classify into one of: ["greeting","smalltalk","out_of_scope","rag_question","code_request","analytics_request","multimodal_audio","other"]. Output exactly one compact JSON: {"intent": "<class>", "confidence": <float>}.
-Guidance:
-- Greetings, misspelled greetings, and "how can you help me"/"what can you do" are "smalltalk" or "greeting" (not code_request).
+    "intent_classifier": '''SYSTEM: You are a high-precision intent classifier. Given the user message, classify into one or more intents from:
+["greeting","smalltalk","out_of_scope","rag_question","code_request","analytics_request","multimodal_audio","email_request","crm_request","other"].
+You MUST output exactly one compact JSON object:
+{
+  "intent": "<primary_intent>",
+  "intents": ["<intent1>", "<intent2>"],
+  "multi_intent": true|false,
+  "confidence": <float 0.0-1.0>
+}
+  Guidance:
+  - Greetings, misspelled greetings, and "how can you help me"/"what can you do" are "smalltalk" or "greeting".
+  - If the user asks to summarize, answer questions from sources, or mentions docs/files/knowledge base -> include "rag_question".
+  - If the user asks for data analysis, forecasting, trends, KPIs, or “based on the dataset/csv/xlsx” -> include "analytics_request".
+  - If the user message contains an email address, you MUST include "email_request" (even if the primary intent is RAG/analytics/CRM).
+  - Any request to send/forward/email results MUST include "email_request".
+  - CRM/ticketing (hubspot/salesforce/zendesk/freshdesk/ticket) -> include "crm_request".
+  - If multiple intents are present, include ALL and set multi_intent=true.
+  Examples:
+  - "hhhi hllelllooooo" -> intent="greeting", intents=["greeting"], multi_intent=false
+  - "summarize all sources and email it to alex@acme.com" -> intents=["rag_question","email_request"], multi_intent=true
+  - "analyze this CSV and email results to me@acme.com" -> intents=["analytics_request","email_request"], multi_intent=true
+  - "close the ticket in HubSpot and email me the confirmation" -> intents=["crm_request","email_request"], multi_intent=true
 Reasoning policy: use internal CoT/ToT/ReAct, do NOT reveal chain-of-thought. Output only JSON.
 Return valid json.''',
     "source_scope_classifier": '''SYSTEM: You are a routing classifier that decides which sources should be used to answer a user query. 
@@ -46,10 +65,11 @@ Generate EXACTLY the following JSON schema:
    "deep_high": { "prompt":"...", "recommended_model":"llama-3.3-70b-versatile", "temperature":0.2, "expected_tokens":1500, "purpose":"Exhaustive multi-step reasoning." }
  }
 }
-CRITICAL RULES:
-1. Do NOT hallucinate facts into the prompts. Simply clarify the user's existing linguistic intent.
-2. If the user commands code, the prompts must explicitly command strict programmatic output formatting.
-3. If the user input is a greeting or misspelled greeting/help request, normalize it into a friendly direct greeting (e.g., "Hi! How can you help me?") and NEVER instruct to "analyze", "break down", or "interpret" the user's message.
+  CRITICAL RULES:
+  1. Do NOT hallucinate facts into the prompts. Simply clarify the user's existing linguistic intent.
+  2. If the user commands code, the prompts must explicitly command strict programmatic output formatting.
+  3. If the user input is a greeting or misspelled greeting/help request, normalize it into a friendly direct greeting (e.g., "Hi! How can you help me?") and NEVER instruct to "analyze", "break down", or "interpret" the user's message.
+  4. NEVER remove or weaken explicit actions requested by the user (e.g., "email/forward/send", "attach file", "create ticket", "update CRM"). Preserve email addresses and action targets verbatim in the rewritten prompts.
 Reasoning policy: use internal CoT/ToT/ReAct, do NOT reveal chain-of-thought. Output only JSON.
 Return valid json.''',
     

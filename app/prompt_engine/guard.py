@@ -137,3 +137,8 @@ class PromptInjectionGuard:
         except json.JSONDecodeError as e:
              logger.error(f"[PROMPT GUARD] LLM failed to emit JSON compliant payload: {e}")
              return {"is_malicious": False, "action": "allow", "evidence": "Guard JSON parse failed; soft-allow"}
+        except Exception as e:
+             logger.error(f"[PROMPT GUARD] Guard evaluation failed: {e}")
+             if os.getenv("GUARD_FAIL_OPEN", "true").lower() == "true":
+                 return {"is_malicious": False, "action": "allow", "evidence": "Guard failure; fail-open"}
+             return {"is_malicious": True, "action": "block", "evidence": "Guard failure"}

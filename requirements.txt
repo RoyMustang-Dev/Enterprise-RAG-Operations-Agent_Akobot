@@ -31,6 +31,7 @@ numpy
 pandas>=2.0.0
 openpyxl>=3.1.2
 markdownify
+tabulate
 selectolax
 transformers
 coqui-tts
@@ -70,3 +71,6 @@ river
 langfuse>=2.0.0
 langfuse-langchain
 langchain-google-genai
+
+# Auth / JWT
+python-jose[cryptography]>=3.3.0

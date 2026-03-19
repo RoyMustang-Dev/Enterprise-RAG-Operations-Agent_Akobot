@@ -4,6 +4,7 @@ SQLite Persistence Layer for Crawler & Analytics.
 
 import sqlite3
 import os
+import time
 import json
 import time
 from datetime import datetime
@@ -348,6 +349,79 @@ def init_session_cache_db(tenant_id: str | None = None):
         updated_at REAL
     )
     """)
+    conn.commit()
+    conn.close()
+
+
+def init_email_audit_db(tenant_id: str | None = None):
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS email_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id TEXT,
+        recipients TEXT,
+        subject TEXT,
+        status TEXT,
+        error TEXT,
+        created_at REAL
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def record_email_audit(tenant_id: str, recipients: str, subject: str, status: str, error: str = ""):
+    init_email_audit_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO email_audit (tenant_id, recipients, subject, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (tenant_id, recipients, subject, status, error or "", time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_recent_emails(tenant_id: str, window_seconds: int) -> int:
+    init_email_audit_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    cutoff = time.time() - window_seconds
+    c.execute(
+        "SELECT COUNT(1) FROM email_audit WHERE tenant_id = ? AND created_at >= ?",
+        (tenant_id, cutoff),
+    )
+    row = c.fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+
+def init_tool_audit_db(tenant_id: str | None = None):
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS tool_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tenant_id TEXT,
+        tool_slug TEXT,
+        status TEXT,
+        error TEXT,
+        created_at REAL
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def record_tool_audit(tenant_id: str, tool_slug: str, status: str, error: str = ""):
+    init_tool_audit_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO tool_audit (tenant_id, tool_slug, status, error, created_at) VALUES (?, ?, ?, ?, ?)",
+        (tenant_id, tool_slug, status, error or "", time.time()),
+    )
     conn.commit()
     conn.close()
 

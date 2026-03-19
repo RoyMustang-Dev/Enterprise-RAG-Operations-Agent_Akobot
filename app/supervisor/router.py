@@ -12,7 +12,7 @@ from typing import Dict, Any
 import re
 
 from app.core.types import AgentState
-from app.infra.database import get_chat_history, save_chat_turn
+from app.infra.database import get_chat_history, save_chat_turn, get_session_cache, upsert_session_cache
 from app.prompt_engine.guard import PromptInjectionGuard
 from app.prompt_engine.rewriter import PromptRewriter
 from app.supervisor.intent import IntentClassifier
@@ -23,7 +23,10 @@ from app.supervisor.planner import AdaptivePlanner
 from app.agents.rag import RAGAgent
 from app.agents.coder import CoderAgent
 from app.reasoning.complexity import ComplexityClassifier
+from app.agents.support_data_analytics import SupportDataAnalyticsAgent
+from app.tools.emailer import send_email_via_composio
 from app.infra.provider_router import ProviderRouter
+from app.infra.llm_client import set_agent_context
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +113,18 @@ class ExecutionGraph:
         if tokens in {"hi", "hii", "hello", "hey", "hey there"} or tokens.startswith(("hi ", "hello ", "hey ")):
             return "Hi! How can you help me?"
         return "Hi! How can you help me?"
+
+    @staticmethod
+    def _extract_email_fields(text: str) -> Dict[str, Any]:
+        import re
+        if not text:
+            return {"recipients": [], "subject": "", "body": ""}
+        emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+        subject_match = re.search(r"subject\s*:\s*(.+)", text, re.IGNORECASE)
+        body_match = re.search(r"body\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+        subject = subject_match.group(1).strip() if subject_match else ""
+        body = body_match.group(1).strip() if body_match else ""
+        return {"recipients": emails, "subject": subject, "body": body}
         
     async def invoke(self, query: str, chat_history: list = None, session_id: str = "", tenant_id: str = None, model_provider: str = "auto", extra_collections: list = None, reranker_profile: str = "auto", reranker_model_name: str = None, force_session_context: bool = False, streaming_callback=None) -> AgentState:
         """
@@ -122,6 +137,7 @@ class ExecutionGraph:
         Returns:
             AgentState: The fully completed dictionary containing the final grounded answer.
         """
+        set_agent_context("router")
         # Initialize the global TypedDict scope
         # Pull recent chat history from SQLite and merge with provided history
         persisted_history = []
@@ -246,7 +262,31 @@ class ExecutionGraph:
                     except Exception:
                         pass
                 return state
-            
+
+        # -------------------------------------------------------------
+        # STEP 2c: DONE -> Retry pending email (if any)
+        # -------------------------------------------------------------
+        if (original_query or "").strip().lower() in {"done", "connected", "ok", "okay", "yes, done"}:
+            cached = get_session_cache(session_id=session_id, tenant_id=tenant_id) or {}
+            pending = (cached.get("cache") or {}).get("pending_email")
+            if pending and pending.get("to"):
+                email_result = send_email_via_composio(
+                    user_id=tenant_id or "default",
+                    to=pending.get("to", []),
+                    subject=pending.get("subject", "Requested insights"),
+                    body=pending.get("body", "")
+                )
+                state["answer"] = "Email sent." if email_result.get("successful") else "Authentication required to send email."
+                state["confidence"] = 0.9 if email_result.get("successful") else 0.6
+                state["optimizations"]["email_action"] = email_result
+                state["chat_history"].append({"role": "assistant", "content": state["answer"]})
+                if session_id:
+                    try:
+                        save_chat_turn(session_id, "assistant", state["answer"], tenant_id=tenant_id)
+                    except Exception:
+                        pass
+                return state
+
         # -------------------------------------------------------------
         # STEP 3: REASONING (Intent + Complexity in Parallel)
         # -------------------------------------------------------------
@@ -255,17 +295,17 @@ class ExecutionGraph:
         intent_report, complexity_score = await asyncio.gather(intent_task, complexity_task)
 
         state["intent"] = intent_report.get("intent", "rag_question")
+        intents = intent_report.get("intents") or [state["intent"]]
+        # Guardrail: if an email address is present, ensure email intent is included
+        email_target = state["optimizations"].get("original_query") or query
+        if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", email_target, re.IGNORECASE):
+            if "email_request" not in intents:
+                intents.append("email_request")
+        state["optimizations"]["intents"] = intents
+        state["optimizations"]["multi_intent"] = intent_report.get("multi_intent", False) or (len(intents) > 1)
         state["optimizations"]["complexity_score"] = complexity_score
         stage_info(logger, "ROUTER:INTENT", f"intent={state['intent']} conf={intent_report.get('confidence')}")
 
-        # Override intent for greeting-like messages to avoid misclassification.
-        if self._looks_like_greeting(original_query):
-            state["intent"] = "smalltalk"
-            normalized = self._normalize_greeting(original_query)
-            state["query"] = normalized
-            state["optimizations"]["rewritten_query"] = normalized
-            stage_info(logger, "ROUTER:INTENT", "intent_override=smalltalk_greeting")
-        
         # -------------------------------------------------------------
         # STEP 4: ADAPTIVE PLANNING (Dynamic Routing)
         # -------------------------------------------------------------
@@ -311,6 +351,7 @@ class ExecutionGraph:
         elif plan.get("route") == "smalltalk":
              logger.info("[ROUTER] Smalltalk Routed. Invoking dynamically...")
              from app.agents.smalltalk import SmalltalkAgent
+             set_agent_context("smalltalk")
              smalltalk_agent = SmalltalkAgent()
              final_state = await smalltalk_agent.ainvoke(state)
              final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
@@ -324,6 +365,7 @@ class ExecutionGraph:
         elif plan.get("route") == "coder_agent":
              logger.info(f"[ROUTER] Dispatching payload to the {state['intent']} Coder Agent.")
              state["optimizations"]["agent_routed"] = "coder_agent"
+             set_agent_context("coder")
              # We execute solely against the Coder MoE ignoring dense 70B RAG chains
              try:
                  final_state = await self.coder_agent.ainvoke(state, config=config)
@@ -345,10 +387,36 @@ class ExecutionGraph:
                      pass
              return final_state
              
+        elif plan.get("route") == "support_da":
+             logger.info("[ROUTER] Dispatching payload to Support Data Analytics agent.")
+             set_agent_context("support_da")
+             support_agent = SupportDataAnalyticsAgent()
+             payload = await support_agent.run(
+                 query=state.get("query") or query,
+                 user_id=tenant_id or "default",
+                 tenant_id=tenant_id or "default",
+                 session_id=session_id or "support-da",
+                 chat_history=chat_history or [],
+             )
+             answer = payload.get("answer") or payload.get("note") or payload.get("status") or "Support action executed."
+             state["answer"] = answer
+             state["confidence"] = 0.99 if payload.get("status") == "success" else 0.7
+             state["optimizations"]["agent_routed"] = "support_data_analytics"
+             state["verifier_verdict"] = "PENDING"
+             state["sources"] = payload.get("sources", []) if isinstance(payload, dict) else []
+             state["chat_history"].append({"role": "assistant", "content": state["answer"]})
+             if session_id:
+                 try:
+                     save_chat_turn(session_id, "assistant", state["answer"], tenant_id=tenant_id)
+                 except Exception:
+                     pass
+             return state
+
         elif plan.get("route") == "rag_agent":
              # Dispatch into the heavy machinery
              logger.info("[ROUTER] Dispatching payload to the dense RAG agent.")
              state["optimizations"]["agent_routed"] = "rag_agent"
+             set_agent_context("rag")
              
              # Execute the end-to-end RAG pipeline
              try:
@@ -360,6 +428,46 @@ class ExecutionGraph:
                  final_state["confidence"] = 0.2
                  final_state.setdefault("sources", [])
              final_state["answer"] = self._strip_think(final_state.get("answer", ""))
+             # Post-RAG tool routing for multi-intent email requests (guarded by recipient extraction)
+             intents = (state.get("optimizations", {}) or {}).get("intents") or []
+             email_fields = self._extract_email_fields(state.get("optimizations", {}).get("original_query") or query)
+             recipients = email_fields.get("recipients") or []
+             if recipients and "email_request" not in intents:
+                 intents.append("email_request")
+             if recipients:
+                 subject = email_fields.get("subject") or "Requested insights"
+                 body = email_fields.get("body") or final_state.get("answer", "")
+                 email_result = send_email_via_composio(
+                     user_id=tenant_id or "default",
+                     to=recipients,
+                     subject=subject,
+                     body=body
+                 )
+                 final_state.setdefault("optimizations", {})
+                 final_state["optimizations"]["email_action"] = email_result
+                 final_state["optimizations"]["intents"] = intents
+                 final_state["optimizations"]["multi_intent"] = len(intents) > 1
+                 if not email_result.get("successful"):
+                     upsert_session_cache(
+                         session_id=session_id,
+                         cache_payload={"pending_email": {"to": recipients, "subject": subject, "body": body}},
+                         tenant_id=tenant_id
+                     )
+             elif "email_request" in intents:
+                 subject = email_fields.get("subject") or "Requested insights"
+                 body = email_fields.get("body") or final_state.get("answer", "")
+                 final_state.setdefault("optimizations", {})
+                 final_state["optimizations"]["email_action"] = {
+                     "successful": False,
+                     "error": "Missing recipient email. Please provide an email address to send the results."
+                 }
+                 final_state["optimizations"]["intents"] = intents
+                 final_state["optimizations"]["multi_intent"] = len(intents) > 1
+                 upsert_session_cache(
+                     session_id=session_id,
+                     cache_payload={"pending_email": {"to": [], "subject": subject, "body": body}},
+                     tenant_id=tenant_id
+                 )
              final_state["chat_history"].append({"role": "assistant", "content": final_state.get("answer", "")})
              if session_id:
                  try:

@@ -1,0 +1,27 @@
+elif name == "get_email_or_send":
+            from app.tools.emailer import send_email_via_composio
+            from app.integrations.composio_tools import is_configured as composio_configured
+
+            if not composio_configured():
+                return json.dumps({
+                    "status": "unavailable",
+                    "message": "COMPOSIO_API_KEY is not configured. External integrations are disabled."
+                })
+
+            intent = arguments.get("intent", "send_email")
+            entity_id = session_id  # Use session_id as Composio entity key
+            params = {}
+            try:
+                params = json.loads(arguments.get("params_json", "{}") or "{}")
+            except Exception:
+                pass
+
+            if intent == "send_email":
+                result = send_email_via_composio(
+                    user_id=entity_id,
+                    to=[params.get("to")] if isinstance(params.get("to"), str) else params.get("to", []),
+                    subject=params.get("subject", "Requested insights"),
+                    body=params.get("body", ""),
+                )
+                if result.get("successful"):
+                    return json

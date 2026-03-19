@@ -12,6 +12,7 @@ import uuid
 import json
 import time
 import logging
+import re
 from typing import List, Dict, Any, Optional, Literal
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, File, UploadFile, Form, Header, Request, Body
@@ -20,7 +21,8 @@ from pydantic import BaseModel, Field
 
 from app.core.telemetry import ObservabilityLayer
 from app.core.rate_limit import TokenBucketRateLimiter
-from app.infra.database import init_ingestion_db, get_ingestion_job, set_current_tenant
+from app.infra.locks import distributed_lock
+from app.infra.database import init_ingestion_db, get_ingestion_job, set_current_tenant, get_chat_history, save_chat_turn
 from app.infra.job_tracker import JobTracker
 from app.infra.hardware import HardwareProbe
 from app.core.types import TelemetryLogRecord, AgentType
@@ -182,6 +184,7 @@ class ChatResponse(BaseModel):
     chat_history: Optional[List[Dict[str, Any]]] = Field(default=[])
     latency_optimizations: Optional[Dict[str, Any]] = Field(default={})
     active_persona: Optional[str] = Field(default=None, description="The bootstrapped persona mapped during execution.")
+    email_action: Optional[Dict[str, Any]] = Field(default=None, description="Email tool execution result when requested.")
 
     model_config = {
         "json_schema_extra": {
@@ -726,7 +729,8 @@ async def chat_endpoint(
             optimizations=result.get("optimizations", {}),
             chat_history=result.get("chat_history", []),
             latency_optimizations=result.get("latency_optimizations", {}),
-            active_persona=result.get("active_persona", None)
+            active_persona=result.get("active_persona", None),
+            email_action=result.get("optimizations", {}).get("email_action")
         )
 
         elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
@@ -823,6 +827,10 @@ async def ingest_files_endpoint(
     try:
         client_id = x_tenant_id or (http_request.client.host if http_request.client else "anonymous")
         _rate_limiter.consume(client_id, cost=2)
+        lock_key = f"ingest_files:{x_tenant_id or 'default'}:{mode}"
+        with distributed_lock(lock_key, ttl_seconds=900) as acquired:
+            if not acquired:
+                raise HTTPException(status_code=409, detail="Ingestion already running for this tenant.")
         job_id = str(uuid.uuid4())
 
         ingestion_jobs[job_id] = JobTracker(job_id, {
@@ -1063,6 +1071,10 @@ async def ingest_crawler_endpoint(
     try:
         client_id = x_tenant_id or (http_request.client.host if http_request.client else "anonymous")
         _rate_limiter.consume(client_id, cost=2)
+        lock_key = f"ingest_crawler:{x_tenant_id or 'default'}:{mode}"
+        with distributed_lock(lock_key, ttl_seconds=1800) as acquired:
+            if not acquired:
+                raise HTTPException(status_code=409, detail="Crawler ingestion already running for this tenant.")
         job_id = str(uuid.uuid4())
 
         ingestion_jobs[job_id] = JobTracker(job_id, {
@@ -1653,6 +1665,29 @@ async def sla_metrics_endpoint(
         "by_agent": by_agent,
     }
 
+
+# -----------------------------------------------------------------------------
+# 8b. Tools: Email (Composio)
+# -----------------------------------------------------------------------------
+@router.post(
+    "/tools/send_email",
+    tags=["Tools"],
+    summary="Send Email via Composio",
+    description="Sends an email using Composio toolkits (Gmail/Outlook) when configured."
+)
+async def send_email_endpoint(
+    payload: Dict[str, Any] = Body(...),
+):
+    from app.tools.emailer import send_email_via_composio
+    user_id = payload.get("user_id", "default")
+    to = payload.get("to", [])
+    subject = payload.get("subject", "")
+    body = payload.get("body", "")
+    if not to or not subject or not body:
+        raise HTTPException(status_code=400, detail="Missing required fields: to, subject, body.")
+    result = send_email_via_composio(user_id=user_id, to=to, subject=subject, body=body)
+    return result
+
 # -----------------------------------------------------------------------------
 # 9. Decoupled Business Analyst Agent Endpoint
 # -----------------------------------------------------------------------------
@@ -1696,20 +1731,49 @@ async def analytics_chat_endpoint(
     import io
     import os
     import json
-    
+
     # Securely retrieve the Persona from Cache
     from app.prompt_engine.groq_prompts.config import PersonaCacheManager
     cache = PersonaCacheManager()
     persona = cache.get_persona()
+    set_current_tenant(x_tenant_id)
 
-    if os.getenv("ANALYTICS_REQUIRE_TENANT", "false").lower() == "true":
+    if os.getenv("ANALYTICS_REQUIRE_TENANT", "true").lower() == "true":
         if not x_tenant_id or x_tenant_id == "default":
             raise HTTPException(status_code=400, detail="x-tenant-id is required for Business Analyst Agent.")
-    
+
+    # Rate limiting (per-tenant)
+    try:
+        from app.infra.rate_limiter import enforce_rate_limit
+        limit = int(os.getenv("BA_RATE_LIMIT_PER_MINUTE", "60"))
+        allowed, remaining, reset = enforce_rate_limit(f"ba:{x_tenant_id or 'default'}", limit, 60)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Try again in {reset}s.",
+                headers={"X-RateLimit-Remaining": str(remaining), "X-RateLimit-Reset": str(reset)},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # Chat history (persisted)
+    history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+    if query:
+        save_chat_turn(session_id=session_id, role="user", content=str(query), tenant_id=x_tenant_id)
+        history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+
+    # Chat history (persisted)
+    history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+    if query:
+        save_chat_turn(session_id=session_id, role="user", content=str(query), tenant_id=x_tenant_id)
+        history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+
     # We strictly mandate tabular data
     if not files:
         raise HTTPException(status_code=400, detail="The Business Analyst Agent requires at least one CSV/Excel file upload to perform mathematical tasks.")
-        
+
     dataframes = []
     sources = []
     for file in files:
@@ -1726,24 +1790,32 @@ async def analytics_chat_endpoint(
         except Exception as e:
             logger.error(f"[ANALYTICS] File parsing failed for {file.filename}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to parse {file.filename} as tabular data.")
-            
+
     if not dataframes:
-         raise HTTPException(status_code=400, detail="No readable CSV or Excel dataframes were extracted from the uploaded files.")
-         
+        raise HTTPException(status_code=400, detail="No readable CSV or Excel dataframes were extracted from the uploaded files.")
+
     from app.agents.data_analytics.supervisor import DataAnalyticsSupervisor
+    from app.supervisor.intent import IntentClassifier
+    from app.tools.emailer import send_email_via_composio
     supervisor = DataAnalyticsSupervisor(dataframes=dataframes, sources=sources)
-    
+    intent_report = await IntentClassifier().classify(query)
+    intents = intent_report.get("intents") or [intent_report.get("intent", "analytics_request")]
+    # Guardrail: if an email address is present, ensure email intent is included
+    if re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", query or ""):
+        if "email_request" not in intents:
+            intents.append("email_request")
+
     logger.info(f"[{session_id}] Executing Business Analyst LangGraph on {len(dataframes)} dataframes.")
     if async_mode:
         from uuid import uuid4
         from app.infra.database import init_analytics_jobs_db, upsert_analytics_job
         job_id = str(uuid4())
-        init_analytics_jobs_db()
+        init_analytics_jobs_db(x_tenant_id)
         upsert_analytics_job(job_id, "queued", "{}", x_tenant_id)
 
         async def _run_job():
             try:
-                payload = await supervisor.run(query=query, persona=persona, session_id=session_id)
+                payload = await supervisor.run(query=query, persona=persona, session_id=session_id, tenant_id=x_tenant_id)
                 upsert_analytics_job(job_id, "completed", json.dumps(payload), x_tenant_id)
             except Exception as e:
                 upsert_analytics_job(job_id, "failed", json.dumps({"error": str(e)}), x_tenant_id)
@@ -1754,13 +1826,203 @@ async def analytics_chat_endpoint(
             await _run_job()
         return {"status": "accepted", "job_id": job_id}
 
-    dashboard_payload = await supervisor.run(query=query, persona=persona, session_id=session_id)
-    
+    # If user confirms "Done", retry pending email before running analysis
+    from app.infra.database import get_session_cache, upsert_session_cache
+    if (query or "").strip().lower() in {"done", "connected", "ok", "okay", "yes, done"}:
+        cached = get_session_cache(session_id=session_id, tenant_id=x_tenant_id) or {}
+        pending = (cached.get("cache") or {}).get("pending_email")
+        if pending and pending.get("to"):
+            email_result = send_email_via_composio(
+                user_id=x_tenant_id or "default",
+                to=pending.get("to", []),
+                subject=pending.get("subject", "Requested insights"),
+                body=pending.get("body", "")
+            )
+            return {"status": "success" if email_result.get("successful") else "auth_required", "email_action": email_result}
+
+    dashboard_payload = await supervisor.run(query=query, persona=persona, session_id=session_id, tenant_id=x_tenant_id)
+    email_action = None
+    if "email_request" in intents:
+        try:
+            emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", query or "")
+            subject_match = re.search(r"subject\\s*:\\s*(.+)", query or "", re.IGNORECASE)
+            body_match = re.search(r"body\\s*:\\s*(.+)", query or "", re.IGNORECASE | re.DOTALL)
+            subject = subject_match.group(1).strip() if subject_match else "Requested insights"
+            body = body_match.group(1).strip() if body_match else (dashboard_payload.get("summary_paragraph") or "")
+            if emails:
+                email_action = send_email_via_composio(
+                    user_id=x_tenant_id or "default",
+                    to=emails,
+                    subject=subject,
+                    body=body
+                )
+                if not email_action.get("successful"):
+                    upsert_session_cache(session_id=session_id, cache_payload={"pending_email": {"to": emails, "subject": subject, "body": body}}, tenant_id=x_tenant_id)
+            else:
+                email_action = {"successful": False, "error": "Missing recipient email. Please include an email address."}
+                upsert_session_cache(session_id=session_id, cache_payload={"pending_email": {"to": [], "subject": subject, "body": body}}, tenant_id=x_tenant_id)
+        except Exception as e:
+            email_action = {"successful": False, "error": f"Email dispatch failed: {e}"}
+
+    try:
+        summary_text = dashboard_payload.get("summary_paragraph") if isinstance(dashboard_payload, dict) else None
+        save_chat_turn(
+            session_id=session_id,
+            role="assistant",
+            content=summary_text or json.dumps(dashboard_payload)[:2000],
+            tenant_id=x_tenant_id,
+        )
+        history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "agent": "BUSINESS_ANALYST",
-        "data": dashboard_payload
+        "data": dashboard_payload,
+        "email_action": email_action,
+        "chat_history": history,
     }
+
+# -----------------------------------------------------------------------------
+# 9b. Support Data Analytics Agent Endpoint
+# -----------------------------------------------------------------------------
+@router.post(
+    "/support_data_analytics/chat",
+    tags=["Analytics"],
+    summary="Support Data Analytics Agent",
+    description="Support agent that can route to smalltalk, RAG, BA, and tools.",
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "session_id": {"type": "string"},
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                                "description": "Optional CSV/Excel files for BA analysis."
+                            }
+                        },
+                        "required": ["query", "session_id"]
+                    }
+                }
+            }
+        }
+    }
+)
+async def support_data_analytics_chat_endpoint(
+    request: Request,
+    query: str = Form(...),
+    session_id: str = Form(...),
+    files: List[UploadFile] = File(default=None),
+    x_tenant_id: str = Header(default="default", alias="x-tenant-id"),
+):
+    import pandas as pd
+    import io
+    import json
+    from app.prompt_engine.groq_prompts.config import PersonaCacheManager
+    cache = PersonaCacheManager()
+    persona = cache.get_persona()
+    set_current_tenant(x_tenant_id)
+    if os.getenv("SUPPORT_DA_REQUIRE_TENANT", "true").lower() == "true":
+        if not x_tenant_id or x_tenant_id == "default":
+            raise HTTPException(status_code=400, detail="x-tenant-id is required for Support Data Analytics Agent.")
+
+    # Rate limiting (per-tenant)
+    try:
+        from app.infra.rate_limiter import enforce_rate_limit
+        limit = int(os.getenv("SUPPORT_DA_RATE_LIMIT_PER_MINUTE", "60"))
+        allowed, remaining, reset = enforce_rate_limit(f"support_da:{x_tenant_id or 'default'}", limit, 60)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Try again in {reset}s.",
+                headers={"X-RateLimit-Remaining": str(remaining), "X-RateLimit-Reset": str(reset)},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # Chat history (persisted)
+    history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+    if query:
+        save_chat_turn(session_id=session_id, role="user", content=str(query), tenant_id=x_tenant_id)
+        history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+
+    if files:
+        dataframes = []
+        sources = []
+        for file in files:
+            contents = await file.read()
+            try:
+                if file.filename.endswith('.csv'):
+                    df = pd.read_csv(io.BytesIO(contents))
+                elif file.filename.endswith(('.xls', '.xlsx')):
+                    df = pd.read_excel(io.BytesIO(contents))
+                else:
+                    continue
+                dataframes.append(df)
+                sources.append({"source": file.filename, "rows": int(len(df))})
+            except Exception as e:
+                logger.error(f"[SUPPORT-DA] File parsing failed for {file.filename}: {e}")
+                raise HTTPException(status_code=400, detail=f"Failed to parse {file.filename} as tabular data.")
+
+        if not dataframes:
+            raise HTTPException(status_code=400, detail="No readable CSV/Excel files provided.")
+
+        from app.agents.support_data_analytics import SupportDataAnalyticsAgent
+        agent = SupportDataAnalyticsAgent()
+        payload = await agent.run(
+            query=query,
+            user_id=x_tenant_id or "support-da-user",
+            tenant_id=x_tenant_id,
+            session_id=session_id,
+            dataframes=dataframes,
+            sources=sources,
+            persona=persona,
+        )
+        try:
+            if isinstance(payload, dict):
+                summary_text = payload.get("answer") or payload.get("summary") or payload.get("message")
+                save_chat_turn(
+                    session_id=session_id,
+                    role="assistant",
+                    content=summary_text or json.dumps(payload)[:2000],
+                    tenant_id=x_tenant_id,
+                )
+                history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+                payload["chat_history"] = history
+        except Exception:
+            pass
+        return payload
+
+    from app.agents.support_data_analytics import SupportDataAnalyticsAgent
+    agent = SupportDataAnalyticsAgent()
+    payload = await agent.run(
+        query=query,
+        user_id=x_tenant_id or "support-da-user",
+        tenant_id=x_tenant_id,
+        session_id=session_id,
+    )
+    try:
+        if isinstance(payload, dict):
+            summary_text = payload.get("answer") or payload.get("summary") or payload.get("message")
+            save_chat_turn(
+                session_id=session_id,
+                role="assistant",
+                content=summary_text or json.dumps(payload)[:2000],
+                tenant_id=x_tenant_id,
+            )
+            history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+            payload["chat_history"] = history
+    except Exception:
+        pass
+    return payload
 
 # -----------------------------------------------------------------------------
 # Analytics Job Status
@@ -1773,7 +2035,7 @@ async def analytics_chat_endpoint(
 )
 async def analytics_job_status(job_id: str, x_tenant_id: str = Header(default="default", alias="x-tenant-id")):
     from app.infra.database import init_analytics_jobs_db, fetch_analytics_job
-    init_analytics_jobs_db()
+    init_analytics_jobs_db(x_tenant_id)
     row = fetch_analytics_job(job_id, x_tenant_id)
     if not row:
         raise HTTPException(status_code=404, detail="Job not found.")

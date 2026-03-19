@@ -497,3 +497,171 @@ Place all stress test assets (crawled docs + datasets) inside `Stress Test/`.
 - RAG synthesis uses native provider streaming (Groq/Gemini) when available.
 - API always streams to the frontend over SSE.
 - If native streaming is not available, API falls back to chunked SSE using final answer.
+
+## 16) Tracked Implementation Plan and Checklist
+Generated: 2026-03-15T06:02:00
+
+### 16.1 AuthN/AuthZ Tenant Isolation Without Client Tokens
+Goal: Work with or without client auth by supporting two modes.
+Mode A: Client brings identity token.
+Mode B: Platform issues its own tenant-scoped access token.
+
+Plan:
+1. Add configuration `AUTH_MODE` with values `client_token` or `platform_token`.
+2. Implement middleware to extract `tenant_id`, `user_id`, `roles`, and `auth_token`.
+3. If `AUTH_MODE=client_token`, validate incoming client token and map to tenant.
+4. If `AUTH_MODE=platform_token`, issue a tenant-scoped JWT on login or API key creation.
+5. Add tenant enforcement to SQL queries, Qdrant collections or payload filters, and file paths for uploads and crawled docs.
+6. Add audit logs for deny events.
+
+Checklist:
+- [ ] Add `AUTH_MODE` to config
+- [ ] Implement auth middleware with two modes
+- [ ] Token validator for client JWT or API key
+- [ ] Tenant mapping table and lookup
+- [ ] Enforce tenant filters in SQL
+- [ ] Enforce tenant filters in Qdrant
+- [ ] Enforce tenant filters in filesystem paths
+- [ ] Add deny audit logs
+- [ ] Add tests for cross-tenant access
+
+### 16.2 RBAC vs Payment Tiers
+Goal: Keep billing tiers as entitlement, add RBAC for operational safety.
+
+Plan:
+1. Keep payment tiers for usage limits and features.
+2. Add RBAC for permissions such as ingestion, crawler, email sending, and admin actions.
+3. Map tiers to default roles.
+4. Allow overrides for enterprise accounts.
+
+Checklist:
+- [ ] Define roles and permissions
+- [ ] Map tiers to roles
+- [ ] Add role checks to sensitive endpoints
+- [ ] Add admin override support
+- [ ] Add tests for role enforcement
+
+### 16.3 Redis Rate Limiter and Distributed Locks
+Plan:
+1. Add Redis client with pooling.
+2. Replace in-memory limiter with Redis token bucket.
+3. Add distributed lock for ingestion, crawler, and tool calls.
+4. Set TTL and retry policy.
+5. Add metrics for lock wait and reject rates.
+
+Checklist:
+- [ ] Redis client + config
+- [ ] Redis limiter implementation
+- [ ] Replace in-memory limiter
+- [ ] Add distributed locks
+- [ ] Add metrics
+- [ ] Add tests for rate limit and lock contention
+
+### 16.4 Multi-worker Uvicorn + Autoscaling
+Plan:
+1. Run `uvicorn` with multiple workers.
+2. Ensure all shared state is externalized to Redis or DB.
+3. Add HPA based on CPU and latency.
+4. Add readiness and liveness probes.
+
+Checklist:
+- [ ] Multi-worker config
+- [ ] Externalize state
+- [ ] Autoscaling policy
+- [ ] Health checks
+
+### 16.5 WAF or API Gateway
+Plan:
+1. Choose gateway.
+2. Enforce auth, rate limits, and schema validation.
+3. Add bot or abuse protection.
+4. Add allowlists for internal endpoints.
+
+Checklist:
+- [ ] Gateway selected
+- [ ] Auth and validation rules
+- [ ] Rate limit policies
+- [ ] Bot protection
+- [ ] Internal endpoint allowlists
+
+### 16.6 Circuit Breakers and Bulkheads for LLM Calls
+Plan:
+1. Add circuit breaker per provider.
+2. Add per-provider concurrency limits.
+3. Add fallback ladder.
+4. Add metrics for opens and retries.
+
+Checklist:
+- [ ] Circuit breaker implementation
+- [ ] Concurrency caps
+- [ ] Fallback ladder
+- [ ] Metrics and dashboards
+
+### 16.7 Composio Auto-Send Email
+Plan:
+1. Wire Composio MCP client.
+2. Add `send_email` tool using Gmail toolkit.
+3. Register tool with RAG, BA, Support-DA.
+4. Add permission policy and allowlist.
+5. Add audit logs.
+
+Checklist:
+- [ ] MCP client configured
+- [ ] `send_email` tool implemented
+- [ ] Tool registered in RAG
+- [ ] Tool registered in BA
+- [ ] Tool registered in Support-DA
+- [ ] Permissions and allowlists
+- [ ] Audit logs
+
+### 16.8 Celery Concurrency
+Plan:
+1. Identify explicit concurrency overrides.
+2. Allow dynamic concurrency from CPU cores.
+3. Enable autoscale for workers.
+4. Ensure task idempotency + locks.
+
+Checklist:
+- [ ] Locate overrides
+- [ ] Dynamic concurrency setting
+- [ ] Autoscale enabled
+- [ ] Task idempotency review
+
+### 16.9 Hybrid Streaming Native First, SSE Fallback
+Plan:
+1. Add provider capability map for streaming.
+2. Use native streaming where supported.
+3. SSE chunked fallback for non-streaming.
+4. Add stream mode metrics.
+
+Checklist:
+- [ ] Capability map
+- [ ] Native streaming enforced
+- [ ] SSE fallback path
+- [ ] Stream mode metrics
+
+### 16.10 Support Data Analytics Agent + Composio
+Plan:
+1. Add Support-DA agent in routing registry.
+2. Add tool registry for prompt guard, rewrite, smalltalk, RAG, BA, and email.
+3. Add Langfuse traces per tool call.
+4. Add tests for tool routing.
+
+Checklist:
+- [ ] Agent registered
+- [ ] Tools wired
+- [ ] Langfuse tracing
+- [ ] Tool routing tests
+
+### 16.11 Composio for RAG + BA Without CRM
+Plan:
+1. Use non-CRM toolkits only.
+2. Add safe tool discovery and allowlist.
+3. Enforce per-tenant permissions.
+4. Add tool execution audit logs.
+
+Checklist:
+- [ ] Non-CRM toolkit allowlist
+- [ ] Tool discovery
+- [ ] Permission checks
+- [ ] Audit logs

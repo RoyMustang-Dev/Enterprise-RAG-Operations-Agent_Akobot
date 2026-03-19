@@ -1,0 +1,133 @@
+async def _deterministic_pipeline(
+        self,
+        query: str,
+        session_id: Optional[str],
+        tenant_id: Optional[str],
+        image_context: Optional[str],
+        forced_sources: Optional[List[Dict[str, Any]]],
+        active_persona: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Deterministic fallback pipeline when tool-calling fails.
+        Uses Modelslab for synthesis/verifier and avoids Groq fallback.
+        """
+        t0 = time.perf_counter()
+        tools_used = []
+
+        # 1) Guard
+        guard = self._get_guard()
+        guard_result = guard.evaluate(query)
+        tools_used.append("check_security")
+        if guard_result.get("action") == "block":
+            return {
+                "answer": "Request blocked by security guard.",
+                "sources": [],
+                "confidence": 0.0,
+                "is_hallucinated": False,
+                "verifier_verdict": "BLOCKED",
+                "email_action": None,
+                "optimizations": {
+                    "agent_routed": f"modular_orchestrator_v2_{self.agent_tag}",
+                    "tools_used": tools_used,
+                    "blocked_by_guard": True,
+                    "active_model": "modelslab",
+                },
+                "latency_optimizations": {"llm_time_ms": round((time.perf_counter() - t0) * 1000, 2), "turns": 1},
+                "active_persona": active_persona,
+            }
+
+        # 2) Rewrite
+        rewritten = query
+        rewriter = self._get_rewriter()
+        if rewriter:
+            try:
+                result_dict = await rewriter.rewrite(query)
+                rewritten = (
+                    result_dict.get("prompts", {}).get("standard_med", {}).get("prompt")
+                    or result_dict.get("prompts", {}).get("concise_low", {}).get("prompt")
+                    or query
+                )
+            except Exception:
+                rewritten = query
+        tools_used.append("rewrite_query")
+
+        # 3) Search PageIndex
+        from app.v2.retrieval.pageindex_tool import search_tree, get_session_node_count
+        node_count = get_session_node_count(session_id=session_id or "", tenant_id=tenant_id)
+        if node_count == 0:
+            return {
+                "answer": "No documents indexed for this session. Please ingest files or crawl a site first.",
+                "sources": [],
+                "confidence": 0.0,
+                "is_hallucinated": False,
+                "verifier_verdict": "NOT_RUN",
+                "email_action": None,
+                "optimizations": {
+                    "agent_routed": f"modular_orchestrator_v2_{self.agent_tag}",
+                    "tools_used": tools_used,
+                    "active_model": "modelslab",
+                },
+                "latency_optimizations": {"llm_time_ms": round((time.perf_counter() - t0) * 1000, 2), "turns": 1},
+                "active_persona": active_persona,
+            }
+
+        results = search_tree(session_id=session_id or "", query=rewritten, top_k=8, tenant_id=tenant_id)
+        if forced_sources:
+            merged = {s.get("node_id"): s for s in forced_sources if s.get("node_id")}
+            for s in results:
+                merged.setdefault(s.get("node_id"), s)
+            results = list(merged.values())
+        tools_used.append("search_pageindex")
+
+        # 4) Synthesize
+        v1_chunks = [
+            {
+                "page_content": n.get("text", n.get("content", "")),
+                "source": n.get("title", n.get("node_id", "unknown")),
+                "score": n.get("score", 0.8),
+            }
+            for n in results
+        ]
+        engine = self._get_synthesis_engine()
+        synth = await asyncio.to_thread(engine.synthesize, query, v1_chunks)
+        tools_used.append("synthesize_answer")
+
+        # 5) Verify
+        verifier = self._get_verifier()
+        verification = await asyncio.to_thread(verifier.verify, synth.get("answer", ""), v1_chunks)
+        tools_used.append("verify_answer")
+
+        # 6) Email tool (if requested)
+        email_action = None
+        if re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", query or ""):
+            params = {
+                "to": re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", query or ""),
+                "subject": "Requested summary",
+                "body": synth.get("answer", ""),
+            }
+            email_action = json.loads(await self._handle_tool_call(
+                "get_email_or_send",
+                {"intent": "send_email", "params_json": json.dumps(params)},
+                session_id=session_id or "",
+                tenant_id=tenant_id,
+                forced_sources=forced_sources,
+            ))
+            tools_used.append("get_email_or_send")
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        return {
+            "answer": synth.get("answer", ""),
+            "sources": synth.get("provenance", []),
+            "confidence": synth.get("confidence", 0.0),
+            "is_hallucinated": verification.get("is_hallucinated", False),
+            "verifier_verdict": verification.get("overall_verdict", "UNVERIFIED"),
+            "email_action": email_action,
+            "optimizations": {
+                "agent_routed": f"modular_orchestrator_v2_{self.agent_tag}",
+                "active_model": "modelslab",
+                "primary_provider": "modelslab",
+                "tools_used": tools_used,
+            },
+            "latency_optimizations": {"llm_time_ms": elapsed_ms, "turns": 1},
+            "active_persona": active_persona,
+        }

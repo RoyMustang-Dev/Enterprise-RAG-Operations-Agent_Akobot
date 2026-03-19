@@ -1,0 +1,17 @@
+if result.get("successful"):
+                    return json.dumps({"status": "success", "result": result})
+                return json.dumps({
+                    "status": "auth_required",
+                    "message": result.get("error", "Authentication required."),
+                    "connect_url": (result.get("data") or {}).get("connect_link"),
+                    "instructions": "Open the connect_url in a browser, complete the OAuth flow, then retry."
+                })
+
+            return json.dumps({
+                "status": "unavailable",
+                "message": f"Intent '{intent}' is not yet implemented. Available: send_email."
+            })
+
+        return json.dumps({"error": f"Unknown tool: {name}"})
+
+    # ---------------------------------------------------------------

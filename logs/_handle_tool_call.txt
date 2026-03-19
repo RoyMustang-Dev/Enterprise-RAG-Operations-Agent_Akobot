@@ -1,0 +1,18 @@
+async def _handle_tool_call(
+        self, name: str, arguments: Dict[str, Any],
+        session_id: str, tenant_id: Optional[str] = None,
+        forced_sources: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+
+        # ── 1. Security Guard ──────────────────────────────────────────
+        if name == "check_security":
+            try:
+                res = self._get_guard().evaluate(arguments["prompt"])
+                return json.dumps(res)
+            except Exception as e:
+                logger.error(f"[V2 ORCHESTRATOR] Guard error: {e}")
+                return json.dumps({"is_malicious": False, "action": "allow", "evidence": f"Guard error: {e}"})
+
+        # ── 2. Query Rewriter ──────────────────────────────────────────
+        elif name == "rewrite_query":
+            rewrite

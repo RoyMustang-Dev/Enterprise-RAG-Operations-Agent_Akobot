@@ -50,5 +50,20 @@ try {
   Write-Host "[CELERY] Purge failed; continuing to start worker. Error: $($_.Exception.Message)"
 }
 
-# Windows-safe pool to avoid WinError 5 with billiard
-& $py -m celery -A app.infra.celery_app.celery_app worker --loglevel=info --pool=solo --concurrency=1
+# Configurable worker settings
+$pool = $env:CELERY_POOL
+if (-not $pool) { $pool = "solo" }
+$concurrency = $env:CELERY_CONCURRENCY
+if (-not $concurrency) { $concurrency = [Environment]::ProcessorCount }
+
+$autoscaleMax = $env:CELERY_AUTOSCALE_MAX
+$autoscaleMin = $env:CELERY_AUTOSCALE_MIN
+
+if ($pool -eq "solo") { $concurrency = 1 }
+
+$args = @("-m", "celery", "-A", "app.infra.celery_app.celery_app", "worker", "--loglevel=info", "--pool=$pool", "--concurrency=$concurrency")
+if ($autoscaleMax -and $autoscaleMin -and $pool -ne "solo") {
+  $args += "--autoscale=$autoscaleMax,$autoscaleMin"
+}
+
+& $py @args
