@@ -17,6 +17,7 @@ import time
 import json
 import logging
 from typing import List, Dict, Any, Optional, Literal
+import re
 
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Header, Request
 from fastapi.responses import StreamingResponse
@@ -24,12 +25,25 @@ from pydantic import BaseModel, Field
 
 from app.core.telemetry import ObservabilityLayer
 from app.core.rate_limit import TokenBucketRateLimiter
-from app.infra.database import set_current_tenant, get_chat_history, save_chat_turn
+from app.infra.database import (
+    set_current_tenant,
+    get_chat_history,
+    save_chat_turn,
+    get_session_cache,
+    upsert_session_cache,
+)
 
 _rate_limiter = TokenBucketRateLimiter()
 router = APIRouter()
 logger = logging.getLogger(__name__)
 telemetry = ObservabilityLayer()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _is_upload_file(obj: Any) -> bool:
+    return bool(obj) and hasattr(obj, "filename") and hasattr(obj, "read")
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +127,14 @@ class IngestionStatusV2(BaseModel):
     status: str
     job_id: str
     payload: Optional[Dict[str, Any]] = None
+
+
+class PageIndexStatusV2(BaseModel):
+    tenant_id: Optional[str]
+    session_id: Optional[str] = None
+    total_sessions: int
+    total_nodes: int
+    sessions: List[Dict[str, Any]]
 
 
 class CrawlerRequestV2(BaseModel):
@@ -252,12 +274,28 @@ async def chat_endpoint_v2(
 
             raw_files = form.getlist("files") if hasattr(form, "getlist") else []
             raw_images = form.getlist("images") if hasattr(form, "getlist") else []
+            # Fallback for single file uploads where getlist may be empty
+            if not raw_files:
+                single_file = form.get("files") or form.get("file") or form.get("documents")
+                if _is_upload_file(single_file):
+                    raw_files = [single_file]
+            if not raw_images:
+                single_img = form.get("images") or form.get("image")
+                if _is_upload_file(single_img):
+                    raw_images = [single_img]
+
+            if not raw_files and not raw_images:
+                try:
+                    keys = list(form.keys()) if hasattr(form, "keys") else []
+                except Exception:
+                    keys = []
+                logger.warning(f"[V2 CHAT] Multipart received with no files/images. Keys={keys}")
 
             allowed_doc_exts = {".csv", ".tsv", ".xlsx", ".docx", ".txt", ".md", ".pdf"}
             allowed_img_exts = {".jpg", ".jpeg", ".png", ".webp"}
 
             for f in raw_files:
-                if isinstance(f, UploadFile) and f.filename:
+                if _is_upload_file(f) and f.filename:
                     ext = os.path.splitext(f.filename)[1].lower()
                     if ext in allowed_img_exts:
                         image_files.append(f)  # Auto-reclassify images placed in files
@@ -268,7 +306,7 @@ async def chat_endpoint_v2(
                         raise HTTPException(status_code=415, detail=f"Unsupported file type: {f.filename}")
 
             for f in raw_images:
-                if isinstance(f, UploadFile) and f.filename:
+                if _is_upload_file(f) and f.filename:
                     ext = os.path.splitext(f.filename)[1].lower()
                     if ext in allowed_img_exts:
                         image_files.append(f)
@@ -291,6 +329,49 @@ async def chat_endpoint_v2(
         _rate_limiter.consume(client_id)
     except Exception as rle:
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Slow down requests. Error: {rle}")
+
+    # ── Email auth "done" → retry pending email ─────────────────────────────
+    if (str(query or "").strip().lower()) in {"done", "connected", "ok", "okay", "yes, done"}:
+        cached = get_session_cache(session_id=session_id, tenant_id=x_tenant_id) or {}
+        pending = (cached.get("cache") or {}).get("pending_email") or {}
+        if pending.get("to"):
+            from app.tools.emailer import send_email_via_composio
+            email_result = send_email_via_composio(
+                user_id=x_tenant_id or "default",
+                to=pending.get("to", []),
+                subject=pending.get("subject", "Requested summary"),
+                body=pending.get("body", ""),
+            )
+            if email_result.get("successful"):
+                try:
+                    upsert_session_cache(
+                        session_id=session_id,
+                        cache_payload={"pending_email": {"to": [], "subject": "", "body": ""}},
+                        tenant_id=x_tenant_id,
+                    )
+                except Exception:
+                    pass
+            if email_result.get("successful"):
+                answer = "Email sent."
+            else:
+                answer = email_result.get("error") or "Authentication required to send email."
+            try:
+                save_chat_turn(session_id=session_id, role="assistant", content=answer, tenant_id=x_tenant_id)
+            except Exception:
+                pass
+            return ChatResponseV2(
+                session_id=session_id,
+                answer=answer,
+                sources=[],
+                confidence=0.9 if email_result.get("successful") else 0.6,
+                verifier_verdict="NOT_RUN",
+                is_hallucinated=False,
+                chat_history=get_chat_history(session_id=session_id, tenant_id=x_tenant_id),
+                email_action=email_result,
+                optimizations={"tools_used": ["get_email_or_send"], "email_retry": True},
+                latency_optimizations={},
+                active_persona=None,
+            )
 
     start = time.perf_counter()
 
@@ -363,10 +444,15 @@ async def chat_endpoint_v2(
             svc = FileUploadServiceV2(tenant_id=x_tenant_id)
             docs = await svc.process_files(file_payloads)
             if docs:
-                node_count = store_documents_in_tree_cache(session_id=session_id, documents=docs, tenant_id=x_tenant_id)
+                node_count = store_documents_in_tree_cache(session_id=session_id, documents=docs, tenant_id=x_tenant_id, mode="append")
                 logger.info(f"[V2 CHAT] Inline file ingest: {len(docs)} docs → {node_count} nodes for session={session_id}")
             else:
-                logger.warning(f"[V2 CHAT] Inline file ingest produced no content for {[f.filename for f in files]}")
+                filenames = [f.filename for f in files]
+                logger.warning(f"[V2 CHAT] Inline file ingest produced no content for {filenames}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Inline upload failed to extract content from: {', '.join(filenames)}"
+                )
         except HTTPException:
             raise
         except Exception as e:
@@ -442,6 +528,32 @@ async def chat_endpoint_v2(
     except Exception:
         pass
     history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+
+    # If email needs auth, store pending email for retry after "done"
+    try:
+        if email_action:
+            status = (email_action.get("status") or "").lower()
+            successful = bool(email_action.get("successful")) or status == "success"
+            if successful:
+                upsert_session_cache(
+                    session_id=session_id,
+                    cache_payload={"pending_email": {"to": [], "subject": "", "body": ""}},
+                    tenant_id=x_tenant_id,
+                )
+            else:
+                # Only store pending email for auth-required retries
+                needs_retry = (status == "auth_required")
+                if needs_retry:
+                    emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", str(query or ""))
+                    subject = "Requested summary"
+                    body = answer_text or ""
+                    upsert_session_cache(
+                        session_id=session_id,
+                        cache_payload={"pending_email": {"to": emails, "subject": subject, "body": body}},
+                        tenant_id=x_tenant_id,
+                    )
+    except Exception:
+        pass
 
     # ── Streaming Response ────────────────────────────────────────────────────
     if stream:
@@ -556,7 +668,7 @@ async def ingest_files_v2_endpoint(
         if not extracted_docs:
             raise HTTPException(status_code=400, detail="No extractable content found in uploaded files. Supported: PDF, DOCX, TXT, MD, CSV, XLSX.")
 
-        node_count = store_documents_in_tree_cache(session_id=session_id, documents=extracted_docs, tenant_id=x_tenant_id)
+        node_count = store_documents_in_tree_cache(session_id=session_id, documents=extracted_docs, tenant_id=x_tenant_id, mode=mode)
 
         logger.info(f"[V2 INGEST FILES] session={session_id} docs={len(extracted_docs)} nodes={node_count} mode={mode}")
         upsert_ingestion_job(
@@ -663,7 +775,7 @@ async def crawl_endpoint_v2(
                 for r in crawler.results_memory
                 if r.get("status") == "success"
             ]
-            node_count = store_documents_in_tree_cache(session_id=session_id, documents=docs, tenant_id=x_tenant_id)
+            node_count = store_documents_in_tree_cache(session_id=session_id, documents=docs, tenant_id=x_tenant_id, mode="append")
             upsert_ingestion_job(
                 job_id=job_id,
                 status="completed",
@@ -712,4 +824,33 @@ async def ingest_status_v2(
             k: v for k, v in job.items()
             if k not in ("status", "job_id", "updated_at")
         } or None,
+    )
+
+
+@router.get(
+    "/ingest/status",
+    response_model=PageIndexStatusV2,
+    tags=["V2 Ingestion"],
+    summary="V2 Ingestion Status (PageIndex)",
+    description="Return PageIndex session stats (node counts) for a tenant, optionally filtered by session_id.",
+)
+async def ingest_status_v2_summary(
+    session_id: Optional[str] = None,
+    x_tenant_id: Optional[str] = Header(default=None, alias="x-tenant-id"),
+):
+    from app.v2.retrieval.pageindex_store import fetch_pageindex_session_stats
+    from app.v2.retrieval.pageindex_tool import get_session_node_count
+
+    sessions = fetch_pageindex_session_stats(tenant_id=x_tenant_id)
+    if session_id:
+        node_count = get_session_node_count(session_id=session_id, tenant_id=x_tenant_id)
+        sessions = [{"session_id": session_id, "nodes_indexed": node_count}]
+
+    total_nodes = sum(int(s.get("nodes_indexed", 0)) for s in sessions)
+    return PageIndexStatusV2(
+        tenant_id=x_tenant_id,
+        session_id=session_id,
+        total_sessions=len(sessions),
+        total_nodes=total_nodes,
+        sessions=sessions,
     )

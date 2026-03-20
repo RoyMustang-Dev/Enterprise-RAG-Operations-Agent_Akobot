@@ -1,0 +1,24 @@
+for f in raw_files:
+                if isinstance(f, UploadFile) and f.filename:
+                    ext = os.path.splitext(f.filename)[1].lower()
+                    if ext in allowed_img_exts:
+                        image_files.append(f)  # Auto-reclassify images placed in files
+                    elif ext in allowed_doc_exts:
+                        files.append(f)
+                        inline_filenames.append(f.filename)
+                    else:
+                        raise HTTPException(status_code=415, detail=f"Unsupported file type: {f.filename}")
+
+            for f in raw_images:
+                if isinstance(f, UploadFile) and f.filename:
+                    ext = os.path.splitext(f.filename)[1].lower()
+                    if ext in allowed_img_exts:
+                        image_files.append(f)
+                    else:
+                        raise HTTPException(status_code=415, detail=f"Unsupported image type: {f.filename}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid multipart payload: {e}")
+    else:
+        raise HTTPException(status_code=415, detail="Unsupporte

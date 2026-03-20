@@ -1,0 +1,30 @@
+       image_context=image_context,
+            chat_history=history,
+            forced_sources=forced_sources,
+        )
+    except Exception as e:
+        import traceback
+        logger.error(f"[V2 CHAT ERROR] {e}\n{traceback.format_exc()}")
+        err_msg = str(e).lower()
+        if any(w in err_msg for w in ["rate limit", "rate_limit", "429", "quota"]):
+            friendly = "The AI service is temporarily rate-limited (too many requests). Please wait a moment and try again."
+        elif any(w in err_msg for w in ["timeout", "timed out", "connect"]):
+            friendly = "The AI service request timed out. Please try again — if this persists, check your API key quota."
+        else:
+            friendly = f"An internal error occurred processing your request. Please try again. (ref: {str(e)[:80]})"
+        return ChatResponseV2(
+            session_id=session_id,
+            answer=friendly,
+            sources=[],
+            confidence=0.0,
+            verifier_verdict="ERROR",
+            is_hallucinated=False,
+            chat_history=history,
+            active_persona=None,
+            email_action=None,
+            optimizations={"error": str(e)[:120], "tools_used": []},
+            latency_optimizations={},
+        )
+    finally:
+        set_current_tenant(None)
+

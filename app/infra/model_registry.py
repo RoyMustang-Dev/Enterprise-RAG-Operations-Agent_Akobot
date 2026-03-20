@@ -42,7 +42,7 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     "security_guard": {
         "provider": "modelslab",
         "fallback_provider": None,
-        "model": "llama-3.1-8b-instant",
+        "model": "gemini-2.5-flash",
         "temperature": 0.0,
         "max_tokens": 20,
     },
@@ -51,7 +51,7 @@ PHASE_MODELS: Dict[str, Dict[str, Any]] = {
     "query_rewriter": {
         "provider": "modelslab",
         "fallback_provider": None,
-        "model": "llama-3.1-8b-instant",
+        "model": "gemini-2.5-flash",
         "temperature": 0.1,
         "max_tokens": 900,
     },

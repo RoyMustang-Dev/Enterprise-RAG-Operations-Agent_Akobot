@@ -1,0 +1,220 @@
+from app.v2.ingestion.file_upload_v2 import FileUploadServiceV2
+            from app.v2.retrieval.pageindex_tool import store_documents_in_tree_cache
+
+            file_payloads = []
+            for f in files:
+                fb = await f.read()
+                if len(fb) > max_mb * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail=f"File {f.filename} exceeds {max_mb}MB limit.")
+                file_payloads.append(UploadFile(filename=f.filename, file=__import__("io").BytesIO(fb)))
+
+            svc = FileUploadServiceV2(tenant_id=x_tenant_id)
+            docs = await svc.process_files(file_payloads)
+            if docs:
+                node_count = store_documents_in_tree_cache(session_id=session_id, documents=docs, tenant_id=x_tenant_id)
+                logger.info(f"[V2 CHAT] Inline file ingest: {len(docs)} docs → {node_count} nodes for session={session_id}")
+            else:
+                logger.warning(f"[V2 CHAT] Inline file ingest produced no content for {[f.filename for f in files]}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[V2 CHAT] Inline file ingest error: {e}")
+
+    # ── Chat history (persisted) ──────────────────────────────────────
+    history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+    if query:
+        save_chat_turn(session_id=session_id, role="user", content=str(query), tenant_id=x_tenant_id)
+        history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+
+    # ── Invoke V2 Orchestrator ─────────────────────────────────────────────────
+    orchestrator = _get_v2_orchestrator()
+    if not orchestrator:
+        raise HTTPException(status_code=501, detail="V2 Orchestrator failed to initialize. Check API keys.")
+
+    try:
+        forced_sources = []
+        if inline_filenames:
+            try:
+                from app.v2.retrieval.pageindex_tool import fetch_nodes_for_titles
+                forced_sources = fetch_nodes_for_titles(
+                    session_id=session_id,
+                    titles=inline_filenames,
+                    tenant_id=x_tenant_id,
+                    limit=24,
+                )
+            except Exception as e:
+                logger.warning(f"[V2 CHAT] Failed to fetch forced sources: {e}")
+        result = await orchestrator.invoke(
+            query=str(query),
+            session_id=session_id,
+            tenant_id=x_tenant_id,
+            image_context=image_context,
+            chat_history=history,
+            forced_sources=forced_sources,
+        )
+    except Exception as e:
+        import traceback
+        logger.error(f"[V2 CHAT ERROR] {e}\n{traceback.format_exc()}")
+        err_msg = str(e).lower()
+        if any(w in err_msg for w in ["rate limit", "rate_limit", "429", "quota"]):
+            friendly = "The AI service is temporarily rate-limited (too many requests). Please wait a moment and try again."
+        elif any(w in err_msg for w in ["timeout", "timed out", "connect"]):
+            friendly = "The AI service request timed out. Please try again — if this persists, check your API key quota."
+        else:
+            friendly = f"An internal error occurred processing your request. Please try again. (ref: {str(e)[:80]})"
+        return ChatResponseV2(
+            session_id=session_id,
+            answer=friendly,
+            sources=[],
+            confidence=0.0,
+            verifier_verdict="ERROR",
+            is_hallucinated=False,
+            chat_history=history,
+            active_persona=None,
+            email_action=None,
+            optimizations={"error": str(e)[:120], "tools_used": []},
+            latency_optimizations={},
+        )
+    finally:
+        set_current_tenant(None)
+
+    # ── Merge image sources into result sources ──────────────────────────────
+    all_sources = image_sources + result.get("sources", [])
+    email_action = result.get("email_action")
+
+    # Persist assistant turn
+    try:
+        answer_text = result.get("answer", "")
+        if answer_text:
+            save_chat_turn(session_id=session_id, role="assistant", content=answer_text, tenant_id=x_tenant_id)
+    except Exception:
+        pass
+    history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+
+    # ── Streaming Response ────────────────────────────────────────────────────
+    if stream:
+        answer_text = result.get("answer", "")
+
+        async def event_gen():
+            for chunk in _chunk_text_for_stream(answer_text):
+                yield f"data: {chunk}\n\n"
+            meta = {
+                "session_id": session_id,
+                "sources": all_sources,
+                "confidence": result.get("confidence", 0.0),
+                "verifier_verdict": result.get("verifier_verdict", "NOT_RUN"),
+                "is_hallucinated": result.get("is_hallucinated", False),
+                "email_action": email_action,
+                "optimizations": result.get("optimizations", {}),
+                "latency_optimizations": result.get("latency_optimizations", {}),
+                "chat_history": history,
+                "active_persona": result.get("active_persona"),
+            }
+            yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+
+        return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+    # ── Standard JSON Response ─────────────────────────────────────────────────
+    elapsed = round((time.perf_counter() - start) * 1000, 2)
+    lat = result.get("latency_optimizations", {})
+    lat["total_time_ms"] = elapsed
+
+    return ChatResponseV2(
+        session_id=session_id,
+        answer=result.get("answer", "No answer generated."),
+        sources=all_sources,
+        confidence=result.get("confidence", 0.0),
+        verifier_verdict=result.get("verifier_verdict", "NOT_RUN"),
+        is_hallucinated=result.get("is_hallucinated", False),
+        optimizations=result.get("optimizations", {}),
+        chat_history=history,
+        latency_optimizations=lat,
+        active_persona=result.get("active_persona"),
+        email_action=email_action,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. File Ingestion Endpoint (V2)
+# ---------------------------------------------------------------------------
+@router.post(
+    "/ingest/files",
+    response_model=IngestionResponseV2,
+    tags=["V2 Ingestion"],
+    summary="Ingest Files to PageIndex (V2)",
+    description=(
+        "Uploads PDF/DOCX/TXT/MD/CSV/XLSX files, extracts Markdown, and builds "
+        "a PageIndex tree indexed by session_id.\n\n"
+        "**mode=append** (default): adds new nodes to an existing session.\n"
+        "**mode=overwrite**: clears existing nodes for that session first.\n\n"
+        "Pass the returned session_id to `/api/v2/chat`."
+    ),
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"},
+                                "description": ".pdf, .docx, .txt, .md, .csv, .tsv, .xlsx",
+                            },
+                            "session_id": {"type": "string", "description": "Optional — reuse existing session."},
+                            "mode": {
+                                "type": "string",
+                                "enum": ["append", "overwrite"],
+                                "default": "append",
+                            },
+                        },
+                        "required": ["files"],
+                    }
+                }
+            }
+        }
+    },
+)
+async def ingest_files_v2_endpoint(
+    http_request: Request,
+    files: List[UploadFile] = File(...),
+    session_id: Optional[str] = Form(default=None),
+    mode: str = Form(default="append"),
+    x_tenant_id: Optional[str] = Header(default=None, alias="x-tenant-id"),
+):
+    job_id = str(uuid.uuid4())
+    session_id = session_id or job_id
+
+    try:
+        from app.v2.ingestion.file_upload_v2 import FileUploadServiceV2
+        from app.v2.retrieval.pageindex_tool import store_documents_in_tree_cache, clear_session_nodes
+        from app.infra.database import upsert_ingestion_job
+
+        # Overwrite mode: clear existing nodes before indexing
+        if mode == "overwrite":
+            try:
+                clear_session_nodes(session_id=session_id, tenant_id=x_tenant_id)
+                logger.info(f"[V2 INGEST] Overwrite mode — cleared session {session_id}")
+            except Exception as e:
+                logger.warning(f"[V2 INGEST] clear_session_nodes failed (may not exist yet): {e}")
+
+        svc = FileUploadServiceV2(tenant_id=x_tenant_id)
+        extracted_docs = await svc.process_files(files)
+
+        if not extracted_docs:
+            raise HTTPException(status_code=400, detail="No extractable content found in uploaded files. Supported: PDF, DOCX, TXT, MD, CSV, XLSX.")
+
+        node_count = store_documents_in_tree_cache(session_id=session_id, documents=extracted_docs, tenant_id=x_tenant_id)
+
+        logger.info(f"[V2 INGEST FILES] session={session_id} docs={len(extracted_docs)} nodes={node_count} mode={mode}")
+        upsert_ingestion_job(
+            job_id=job_id,
+            status="completed",
+            payload={
+                "message": f"Indexed {len(extracted_docs)} document(s) → {node_count} PageIndex nodes (mode={mode}).",
+                "session_id": session_id,
+                "nodes_indexed": node_count,
+            },
+            tenant_id=x_tenant_id,
+        )
+        

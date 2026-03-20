@@ -54,6 +54,35 @@ _PROVIDER_STREAM_SUPPORT = {
 
 _provider_sync_semaphores: Dict[str, threading.Semaphore] = {}
 _provider_async_semaphores: Dict[str, asyncio.Semaphore] = {}
+_provider_key_index: Dict[str, int] = {}
+
+
+def extract_message_content(data: Dict[str, Any]) -> str:
+    """
+    Best-effort extraction of assistant message content from provider responses.
+    Returns empty string if content is missing or null.
+    """
+    if not isinstance(data, dict):
+        return ""
+    try:
+        choices = data.get("choices") or []
+        if choices:
+            message = (choices[0] or {}).get("message") or {}
+            content = message.get("content")
+            if content is None:
+                content = message.get("text")
+            if content is None:
+                return ""
+            if isinstance(content, str):
+                return content
+            return str(content)
+        # Some providers may return a top-level content/text field
+        content = data.get("content") or data.get("text")
+        if content is None:
+            return ""
+        return content if isinstance(content, str) else str(content)
+    except Exception:
+        return ""
 
 
 def provider_supports_stream(provider: str) -> bool:
@@ -126,19 +155,37 @@ def _apply_modelslab_constraints(
     return adjusted
 
 
-def _provider_key(provider: str) -> Optional[str]:
+def _provider_keys(provider: str) -> List[str]:
     provider = (provider or "").lower()
     if provider == "modelslab":
-        return os.getenv("MODELSLAB_API_KEY")
+        key = os.getenv("MODELSLAB_API_KEY")
+        return [key] if key else []
     if provider == "groq":
-        return os.getenv("GROQ_API_KEY")
+        keys = []
+        for k in ["GROQ_API_KEY", "GROQ_API_KEY_2"]:
+            v = os.getenv(k)
+            if v:
+                keys.append(v)
+        return keys
     if provider == "openai":
-        return os.getenv("OPENAI_API_KEY")
+        key = os.getenv("OPENAI_API_KEY")
+        return [key] if key else []
     if provider == "anthropic":
-        return os.getenv("ANTHROPIC_API_KEY")
+        key = os.getenv("ANTHROPIC_API_KEY")
+        return [key] if key else []
     if provider == "gemini":
-        return os.getenv("GEMINI_API_KEY")
-    return None
+        key = os.getenv("GEMINI_API_KEY")
+        return [key] if key else []
+    return []
+
+
+def _provider_key(provider: str) -> Optional[str]:
+    keys = _provider_keys(provider)
+    if not keys:
+        return None
+    idx = _provider_key_index.get(provider, 0) % len(keys)
+    _provider_key_index[provider] = idx + 1
+    return keys[idx]
 
 
 def _endpoint_and_payload(
@@ -148,6 +195,7 @@ def _endpoint_and_payload(
     temperature: float,
     max_tokens: Optional[int],
     response_format: Optional[Dict[str, Any]],
+    api_key: Optional[str],
 ) -> Dict[str, Any]:
     provider = (provider or "").lower()
 
@@ -158,7 +206,7 @@ def _endpoint_and_payload(
         temperature = constrained["temperature"]
         response_format = constrained["response_format"]
         payload: Dict[str, Any] = {
-            "key": _provider_key("modelslab"),
+            "key": api_key,
             "model_id": model,
             "messages": messages,
             "temperature": temperature,
@@ -191,7 +239,7 @@ def _endpoint_and_payload(
         if max_tokens is not None:
             payload["generationConfig"]["maxOutputTokens"] = max_tokens
         return {
-            "url": f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={_provider_key('gemini')}",
+            "url": f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
             "headers": {"Content-Type": "application/json"},
             "payload": payload,
             "adapter": "gemini",
@@ -210,7 +258,7 @@ def _endpoint_and_payload(
 
     return {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "headers": {"Authorization": f"Bearer {_provider_key('groq')}", "Content-Type": "application/json"},
+        "headers": {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         "payload": payload,
     }
 
@@ -237,7 +285,7 @@ async def achat_completion(
     if not breaker.allow():
         raise RuntimeError(f"Circuit breaker open for provider: {provider}")
 
-    req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format)
+    req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format, key)
     groq_retries = int(os.getenv("GROQ_RETRY_MAX", "3")) if provider.lower() == "groq" else 1
     backoff = float(os.getenv("GROQ_RETRY_BACKOFF_SEC", "1.5"))
     try:
@@ -318,14 +366,14 @@ async def achat_completion_stream(
     if not breaker.allow():
         raise RuntimeError(f"Circuit breaker open for provider: {provider}")
 
-    req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format)
+    req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format, key)
     payload = dict(req["payload"])
     payload["stream"] = True
 
     # Gemini streaming uses streamGenerateContent with SSE.
     if req.get("adapter") == "gemini":
         req = dict(req)
-        req["url"] = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={_provider_key('gemini')}"
+        req["url"] = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}"
         # Gemini streaming does not use OpenAI-style `stream` param
         payload.pop("stream", None)
 
@@ -417,7 +465,7 @@ def chat_completion(
     if not breaker.allow():
         raise RuntimeError(f"Circuit breaker open for provider: {provider}")
 
-    req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format)
+    req = _endpoint_and_payload(provider, model, messages, temperature, max_tokens, response_format, key)
     groq_retries = int(os.getenv("GROQ_RETRY_MAX", "3")) if provider.lower() == "groq" else 1
     backoff = float(os.getenv("GROQ_RETRY_BACKOFF_SEC", "1.5"))
     try:

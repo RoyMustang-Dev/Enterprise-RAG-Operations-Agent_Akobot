@@ -1,0 +1,23 @@
+─────────────
+    query = None
+    session_id = None
+    model_provider = "auto"
+    image_mode = "auto"
+    stream = False
+    files: List[UploadFile] = []
+    image_files: List[UploadFile] = []
+    inline_filenames: List[str] = []
+
+    content_type = (http_request.headers.get("content-type", "") or "").lower()
+
+    if content_type.startswith("application/json"):
+        try:
+            raw = await http_request.json()
+            parsed = ChatRequestV2(**raw)
+            query = parsed.query
+            model_provider = parsed.model_provider or "auto"
+            session_id = parsed.session_id
+            image_mode = parsed.image_mode or "auto"
+            stream = bool(parsed.stream)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON p

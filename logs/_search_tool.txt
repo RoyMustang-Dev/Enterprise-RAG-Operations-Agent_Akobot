@@ -1,0 +1,23 @@
+elif name == "search_pageindex":
+            from app.v2.retrieval.pageindex_tool import search_tree, get_session_node_count
+            query = arguments["query"]
+            top_k = int(arguments.get("top_k", 8))
+            node_count = get_session_node_count(session_id, tenant_id=tenant_id)
+
+            if node_count == 0:
+                return json.dumps({
+                    "sources": [],
+                    "message": (
+                        "No documents have been indexed for this session yet. "
+                        "The user must call /api/v2/ingest/files or /api/v2/ingest/crawler first, "
+                        "then use the returned session_id here."
+                    )
+                })
+            results = search_tree(session_id=session_id, query=query, top_k=top_k, tenant_id=tenant_id)
+            if forced_sources:
+                merged = {s.get("node_id"): s for s in forced_sources if s.get("node_id")}
+                for s in results:
+                    merged.setdefault(s.get("node_id"), s)
+                results = list(merged.values())
+            logger.info(f"[V2 ORCHESTRATOR] PageIndex → {len(results)} nodes for '{query[:40]}'")
+            self

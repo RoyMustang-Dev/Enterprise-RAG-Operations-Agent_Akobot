@@ -51,16 +51,22 @@ def _make_async_client(agent_tag: str = "rag_v2"):
     groq_key = os.getenv("GROQ_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
 
-    # Priority: ModelsLab Dev Tier → Groq → OpenAI
-    if modelslab_key:
+    force_provider = os.getenv("FORCE_TOOL_PROVIDER", "").strip().lower()
+
+    # Priority: Groq (tool-calling reliability) → ModelsLab → OpenAI
+    if force_provider == "modelslab" and modelslab_key:
         api_key = modelslab_key
-        # ModelsLab v6 OpenAI-compat base — SDK appends /chat/completions automatically
-        base_url = "https://modelslab.com/api/v6/llm"
+        base_url = "https://modelslab.com/api/v7/llm"
         primary_provider = "modelslab"
     elif groq_key:
         api_key = groq_key
         base_url = "https://api.groq.com/openai/v1"
         primary_provider = "groq"
+    elif modelslab_key:
+        api_key = modelslab_key
+        # ModelsLab v7 OpenAI-compat base — SDK appends /chat/completions automatically
+        base_url = "https://modelslab.com/api/v7/llm"
+        primary_provider = "modelslab"
     else:
         api_key = openai_key or ""
         base_url = None
@@ -73,6 +79,8 @@ def _make_async_client(agent_tag: str = "rag_v2"):
             client = LangfuseAsyncOpenAI(
                 api_key=api_key,
                 base_url=base_url,
+                max_retries=0,
+                timeout=30,
             )
             try:
                 import langfuse
@@ -92,17 +100,27 @@ def _make_async_client(agent_tag: str = "rag_v2"):
             logger.warning(f"[V2 ORCHESTRATOR] Langfuse init failed: {e}")
 
     from openai import AsyncOpenAI
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0, timeout=30)
     return client, primary_provider, api_key, base_url
 
 
 # ---------------------------------------------------------------------------
 # Model chains per provider
 # ---------------------------------------------------------------------------
-_MODELSLAB_MODEL_CHAIN = [
-    "gemini-2.5-flash",          # ModelsLab Dev Tier — best quality synthesis
-    "gemini-2.0-flash",
-]
+def _env_model_chain(env_key: str, fallback: List[str]) -> List[str]:
+    raw = os.getenv(env_key, "").strip()
+    if not raw:
+        return fallback
+    items = [m.strip() for m in raw.split(",") if m.strip()]
+    return items or fallback
+
+_MODELSLAB_MODEL_CHAIN = _env_model_chain(
+    "MODELSLAB_TOOLCALL_MODELS",
+    [
+        "gemini-2.5-flash",          # ModelsLab Dev Tier — best quality synthesis
+        "gemini-2.0-flash",
+    ],
+)
 _GROQ_MODEL_CHAIN = [
     "llama-3.3-70b-versatile",   # Last resort — good tool calling, but has daily TPD limits
     "llama-3.1-8b-instant",      # Fallback: fast + cheap
@@ -126,6 +144,9 @@ class ModularOrchestrator:
         self._synthesis_engine = None
         self._verifier = None
         self._last_sources: List[Dict[str, Any]] = []
+        self._email_sent = False
+        self._has_synthesized = False
+        self._last_email_action: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _should_send_email(query: str) -> bool:
@@ -139,6 +160,60 @@ class ModularOrchestrator:
         if re.search(email_regex, query):
             return True
         return bool(re.search(r"\b(email|mail|send)\b", query, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _needs_rag(query: str) -> bool:
+        if not query:
+            return False
+        keywords = [
+            "summarise", "summarize", "summary", "key-points", "key points",
+            "sources", "document", "docs", "resume", "cv", "fit-analysis", "analysis",
+        ]
+        q = query.lower()
+        return any(k in q for k in keywords)
+
+    @staticmethod
+    def _strip_email_disclaimer(text: str) -> str:
+        if not text:
+            return text
+        lines = text.splitlines()
+        cleaned = []
+        for line in lines:
+            lower = line.lower()
+            if (
+                "i cannot send" in lower
+                or "i can't send" in lower
+                or "i cant send" in lower
+                or "don’t have the capability to send emails" in lower
+                or "don't have the capability to send emails" in lower
+                or "do not have the capability to send emails" in lower
+                or "cannot send emails directly" in lower
+            ):
+                continue
+            if "copy and paste this information into an email" in lower:
+                continue
+            cleaned.append(line)
+        return "\n".join(cleaned).strip()
+
+    @staticmethod
+    def _strip_email_template(text: str) -> str:
+        if not text:
+            return text
+        # Drop any inline "sample email" section the model may generate
+        import re as _re
+        patterns = [
+            r"###\s*Email to.*",  # section header
+            r"Since this is a text-based AI model.*",
+            r"\*\*Subject:.*",
+            r"Dear\s+\[?Name\]?.*",
+        ]
+        # If any pattern matches, truncate from that line onwards
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            for pat in patterns:
+                if _re.match(pat, line.strip(), flags=_re.IGNORECASE):
+                    return "\n".join(lines[:i]).strip()
+        return text
 
     # ------------------------------------------------------------------
     # Lazy component getters
@@ -178,7 +253,9 @@ class ModularOrchestrator:
                 from openai import AsyncOpenAI
                 self._groq_client = AsyncOpenAI(
                     api_key=groq_key,
-                    base_url="https://api.groq.com/openai/v1"
+                    base_url="https://api.groq.com/openai/v1",
+                    max_retries=0,
+                    timeout=30,
                 )
         return self._groq_client
 
@@ -191,7 +268,9 @@ class ModularOrchestrator:
                 from openai import AsyncOpenAI
                 self._modelslab_client = AsyncOpenAI(
                     api_key=ml_key,
-                    base_url="https://modelslab.com/api/v6/llm"
+                    base_url="https://modelslab.com/api/v7/llm",
+                    max_retries=0,
+                    timeout=30,
                 )
         return self._modelslab_client
 
@@ -294,34 +373,50 @@ class ModularOrchestrator:
                     }
                 }
             },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_email_or_send",
-                    "description": (
-                        "Call when the user wants to send an email, check calendar, or interact with CRM. "
-                        "If the user is not yet connected to Gmail/calendar, returns a connect_url for OAuth. "
-                        "If already connected, executes the requested action. "
-                        "DO NOT call this unless the user explicitly asks for an external action."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "intent": {
-                                "type": "string",
-                                "enum": ["send_email", "check_gmail", "get_calendar", "create_crm_contact"],
-                                "description": "The external action the user wants to perform."
+        ]
+        # Optional: allow tool-calling for email/CRM only if explicitly enabled.
+        if os.getenv("EMAIL_TOOL_CALLING_ENABLED", "false").lower() == "true":
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_email_or_send",
+                        "description": (
+                            "Call when the user wants to send an email, check calendar, or interact with CRM. "
+                            "If the user is not yet connected to Gmail/calendar, returns a connect_url for OAuth. "
+                            "If already connected, executes the requested action. "
+                            "DO NOT call this unless the user explicitly asks for an external action."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "intent": {
+                                    "type": "string",
+                                    "enum": ["send_email", "check_gmail", "get_calendar", "create_crm_contact"],
+                                    "description": "The external action the user wants to perform."
+                                },
+                                "params_json": {
+                                    "type": "string",
+                                    "description": "JSON-encoded parameters for the action (e.g. {to, subject, body} for send_email)."
+                                },
+                                "to": {
+                                    "type": "string",
+                                    "description": "Direct recipient email (fallback if params_json omitted)."
+                                },
+                                "subject": {
+                                    "type": "string",
+                                    "description": "Direct subject (fallback if params_json omitted)."
+                                },
+                                "body": {
+                                    "type": "string",
+                                    "description": "Direct body (fallback if params_json omitted)."
+                                }
                             },
-                            "params_json": {
-                                "type": "string",
-                                "description": "JSON-encoded parameters for the action (e.g. {to, subject, body} for send_email)."
-                            }
-                        },
-                        "required": ["intent"]
+                            "required": ["intent"]
+                        }
                     }
                 }
-            },
-        ]
+            )
         return tools
 
     # ------------------------------------------------------------------
@@ -430,6 +525,7 @@ class ModularOrchestrator:
                     final_result = result_a
                 final_result["answer"] = winning_answer
                 logger.info(f"[V2 ORCHESTRATOR] Synthesis completed — confidence={final_result.get('confidence', 0)}")
+                self._has_synthesized = True
                 return json.dumps({
                     "answer": final_result.get("answer", ""),
                     "confidence": final_result.get("confidence", 0.0),
@@ -478,6 +574,18 @@ class ModularOrchestrator:
             from app.tools.emailer import send_email_via_composio
             from app.integrations.composio_tools import is_configured as composio_configured
 
+            # Defer email until we have a synthesized answer to send
+            if not self._has_synthesized:
+                return json.dumps({
+                    "status": "deferred",
+                    "message": "Email deferred until after synthesis is complete."
+                })
+
+            if self._email_sent:
+                if self._last_email_action:
+                    return json.dumps(self._last_email_action)
+                return json.dumps({"status": "duplicate_ignored", "message": "Email already dispatched in this request."})
+
             if not composio_configured():
                 return json.dumps({
                     "status": "unavailable",
@@ -491,22 +599,70 @@ class ModularOrchestrator:
                 params = json.loads(arguments.get("params_json", "{}") or "{}")
             except Exception:
                 pass
+            # Support direct args if the model skipped params_json
+            if not params:
+                if any(k in arguments for k in ("to", "subject", "body")):
+                    params = {
+                        "to": arguments.get("to"),
+                        "subject": arguments.get("subject"),
+                        "body": arguments.get("body"),
+                    }
+            logger.info(f"[V2 ORCHESTRATOR] Email params resolved: to={params.get('to')} subject={'yes' if params.get('subject') else 'no'} body_len={len(params.get('body') or '')}")
 
             if intent == "send_email":
-                result = send_email_via_composio(
-                    user_id=entity_id,
-                    to=[params.get("to")] if isinstance(params.get("to"), str) else params.get("to", []),
-                    subject=params.get("subject", "Requested insights"),
-                    body=params.get("body", ""),
-                )
+                try:
+                    result = send_email_via_composio(
+                        user_id=entity_id,
+                        to=[params.get("to")] if isinstance(params.get("to"), str) else params.get("to", []),
+                        subject=params.get("subject", "Requested insights"),
+                        body=params.get("body", ""),
+                    )
+                except Exception as e:
+                    return json.dumps({"status": "error", "message": f"Email tool failed: {e}"})
                 if result.get("successful"):
-                    return json.dumps({"status": "success", "result": result})
-                return json.dumps({
+                    self._email_sent = True
+                    self._last_email_action = {"status": "success", "result": result}
+                    return json.dumps(self._last_email_action)
+                err_msg = (result.get("error") or "").lower()
+                if any(s in err_msg for s in ["invalid email", "empty recipient", "policy", "blocked"]):
+                    # Allow a fallback attempt if we can recover a valid address later
+                    self._email_sent = False
+                    self._last_email_action = {
+                        "status": "error",
+                        "message": result.get("error", "Email failed validation."),
+                    }
+                    return json.dumps(self._last_email_action)
+                self._email_sent = True
+                self._last_email_action = {
                     "status": "auth_required",
                     "message": result.get("error", "Authentication required."),
                     "connect_url": (result.get("data") or {}).get("connect_link"),
                     "instructions": "Open the connect_url in a browser, complete the OAuth flow, then retry."
-                })
+                }
+                return json.dumps(self._last_email_action)
+
+            if intent == "create_crm_contact":
+                from app.integrations.composio_tool_router import ComposioToolRouterClient
+                client = ComposioToolRouterClient()
+                session = client.create_session(user_id=entity_id)
+                if not session or session.get("error"):
+                    return json.dumps({"status": "error", "message": "Failed to create Composio session."})
+                sid = session.get("session_id")
+                try:
+                    search = client.search_tools(sid, "create crm contact")
+                    statuses = search.get("toolkit_connection_statuses") or []
+                    disconnected = [s for s in statuses if not s.get("has_active_connection")]
+                    if disconnected:
+                        toolkit = (disconnected[0] or {}).get("toolkit", "hubspot")
+                        link = client.create_link(sid, toolkit)
+                        return json.dumps({
+                            "status": "auth_required",
+                            "message": "CRM connection required.",
+                            "connect_url": link.get("redirect_url") or link.get("url") or link.get("link") or link,
+                        })
+                except Exception:
+                    pass
+                return json.dumps({"status": "unavailable", "message": "CRM execution not implemented yet."})
 
             return json.dumps({
                 "status": "unavailable",
@@ -530,24 +686,68 @@ class ModularOrchestrator:
         Priority: ModelsLab only.
         """
         from openai import RateLimitError
+        toolcall_timeout = int(os.getenv("TOOLCALL_TIMEOUT_SEC", "8"))
 
-        # ── Tier 1: ModelsLab ──
+        force_provider = os.getenv("FORCE_TOOL_PROVIDER", "").strip().lower()
+
+        # ── Tier 1: Groq (reliable tool calling) ──
+        allow_groq_fallback = os.getenv("ALLOW_GROQ_TOOLCALL_FALLBACK", "true").lower() == "true"
+        groq_client = None if (force_provider == "modelslab" and not allow_groq_fallback) else (
+            self._get_groq_client() if self.primary_provider != "groq" else self.client
+        )
+        if groq_client:
+            for model in _GROQ_MODEL_CHAIN:
+                try:
+                    kwargs = dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens, timeout=toolcall_timeout)
+                    if tools:
+                        kwargs["tools"] = tools
+                        kwargs["tool_choice"] = "auto"
+                    response = await groq_client.chat.completions.create(**kwargs)
+                    return response, model
+                except RateLimitError as rle:
+                    logger.warning(f"[V2 ORCHESTRATOR] Groq rate-limit on {model}: {rle}")
+                    continue
+                except Exception as e:
+                    if "invalid_api_key" in str(e).lower():
+                        logger.warning("[V2 ORCHESTRATOR] Groq API key invalid; skipping Groq tool-calling.")
+                        break
+                    logger.warning(f"[V2 ORCHESTRATOR] Groq error on {model}: {e} — trying next Groq model")
+                    break
+
+        # ── Tier 2: ModelsLab ──
         ml_client = self._get_modelslab_client()
         if ml_client:
             for model in _MODELSLAB_MODEL_CHAIN:
                 try:
-                    kwargs = dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+                    kwargs = dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens, timeout=toolcall_timeout)
                     if tools:
                         kwargs["tools"] = tools
                         kwargs["tool_choice"] = "auto"
                     response = await ml_client.chat.completions.create(**kwargs)
+                    # Handle ModelsLab error envelopes (choices may be None)
+                    if getattr(response, "status", None) == "error" or not getattr(response, "choices", None):
+                        msg = getattr(response, "message", "unknown_error")
+                        raise RuntimeError(f"modelslab_error={msg}")
                     return response, model
                 except RateLimitError as rle:
                     logger.warning(f"[V2 ORCHESTRATOR] ModelsLab rate-limit on {model}: {rle}")
                     continue
                 except Exception as e:
-                    logger.warning(f"[V2 ORCHESTRATOR] ModelsLab error on {model}: {e} — trying Groq")
-                    break
+                    logger.warning(f"[V2 ORCHESTRATOR] ModelsLab error on {model}: {e} — trying next ModelsLab model")
+                    continue
+
+        # If ModelsLab failed and Groq fallback is allowed, try Groq as last resort.
+        if allow_groq_fallback and groq_client:
+            for model in _GROQ_MODEL_CHAIN:
+                try:
+                    kwargs = dict(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens, timeout=toolcall_timeout)
+                    if tools:
+                        kwargs["tools"] = tools
+                        kwargs["tool_choice"] = "auto"
+                    response = await groq_client.chat.completions.create(**kwargs)
+                    return response, model
+                except Exception:
+                    continue
 
         return None, "none"
 
@@ -581,6 +781,10 @@ class ModularOrchestrator:
 
         session_id = session_id or str(uuid.uuid4())
         t0 = time.perf_counter()
+        # Per-request email guard must be reset for each invocation
+        self._email_sent = False
+        self._has_synthesized = False
+        self._last_email_action = None
         tools_called: List[str] = []
         blocked = False
         final_sources = forced_sources[:] if forced_sources else []
@@ -603,6 +807,7 @@ class ModularOrchestrator:
                     f'Brand Details: {persona.get("brand_details", "")}\n'
                     f'Brand Welcome Greeting: {persona.get("welcome_message", "")}\n'
                     f'Core Directives:\n{persona.get("expanded_prompt", "")}\n'
+                    "IMPORTANT: Use persona details only for tone/style. Do NOT quote or repeat these lines verbatim in the final answer.\n"
                     "[END GLOBAL PERSONA]\n\n---\n"
                 )
             else:
@@ -625,7 +830,8 @@ class ModularOrchestrator:
             "'Answer ONLY using the provided context. If not in context, say I don\\'t know.'\n"
             "7. Only call get_email_or_send if the user explicitly requests an email/calendar/CRM action.\n"
             "8. Your final response must be the verified answer. Cite node IDs when referencing sources.\n"
-            "9. If search_pageindex returns empty sources, tell the user to ingest documents first."
+            "9. If search_pageindex returns empty sources, tell the user to ingest documents first.\n"
+            "10. Do NOT claim you cannot send emails; email actions are handled by tools and response metadata."
         )
 
         messages: List[Dict] = [{"role": "system", "content": system_content}]
@@ -664,6 +870,7 @@ class ModularOrchestrator:
                     image_context=image_context,
                     forced_sources=forced_sources,
                     active_persona=active_persona,
+                    allow_email=True,
                 )
 
             if response is None:
@@ -675,6 +882,7 @@ class ModularOrchestrator:
                     image_context=image_context,
                     forced_sources=forced_sources,
                     active_persona=active_persona,
+                    allow_email=True,
                 )
 
             message = response.choices[0].message
@@ -692,6 +900,18 @@ class ModularOrchestrator:
             messages.append(msg_dict)
 
             if not message.tool_calls:
+                # If model ignored tool-calling on the first turn, fall back to deterministic pipeline
+                if turn == 0:
+                    logger.warning("[V2 ORCHESTRATOR] No tool calls on first turn; falling back to deterministic pipeline.")
+                    return await self._deterministic_pipeline(
+                        query=query,
+                        session_id=session_id,
+                        tenant_id=tenant_id,
+                        image_context=image_context,
+                        forced_sources=forced_sources,
+                        active_persona=active_persona,
+                        allow_email=True,
+                    )
                 # Final answer produced
                 break
 
@@ -744,7 +964,8 @@ class ModularOrchestrator:
                             final_confidence *= 0.5
 
                     elif func_name == "get_email_or_send":
-                        email_action = result_data
+                        if email_action is None or (result_data.get("status") == "success"):
+                            email_action = result_data
 
                 except Exception:
                     pass
@@ -788,6 +1009,32 @@ class ModularOrchestrator:
                 break
         if not final_answer:
             final_answer = "The orchestrator completed execution but produced no text output."
+        final_answer = self._strip_email_disclaimer(self._strip_email_template(final_answer))
+
+        # If tool-calling skipped retrieval/synthesis, fall back to deterministic RAG
+        if ("search_pageindex" in tools_called) and ("synthesize_answer" not in tools_called):
+            logger.warning("[V2 ORCHESTRATOR] Tool-calling skipped synthesis; using deterministic pipeline.")
+            return await self._deterministic_pipeline(
+                query=query,
+                session_id=session_id,
+                tenant_id=tenant_id,
+                image_context=image_context,
+                forced_sources=forced_sources,
+                active_persona=active_persona,
+                allow_email=True,
+            )
+        # If tool-calling never invoked retrieval for a RAG-like query, force deterministic pipeline
+        if ("search_pageindex" not in tools_called) and self._needs_rag(query):
+            logger.warning("[V2 ORCHESTRATOR] Tool-calling skipped retrieval; using deterministic pipeline.")
+            return await self._deterministic_pipeline(
+                query=query,
+                session_id=session_id,
+                tenant_id=tenant_id,
+                image_context=image_context,
+                forced_sources=forced_sources,
+                active_persona=active_persona,
+                allow_email=True,
+            )
 
         # ── Strip thinking-process prefixes from final answer ─────────
         # Some models emit reasoning text before the actual answer.
@@ -818,7 +1065,17 @@ class ModularOrchestrator:
             final_confidence = min(final_confidence, 0.55)
 
         # Deterministic email tool call if user asked for email and tool-calling did not trigger it
-        if email_action is None and self._should_send_email(query):
+        retry_email = False
+        if email_action:
+            status = (email_action.get("status") or "").lower()
+            if status == "deferred":
+                retry_email = True
+            if status == "error":
+                msg = (email_action.get("message") or "").lower()
+                if "invalid or empty recipient" in msg or "invalid email" in msg:
+                    retry_email = True
+
+        if (email_action is None or retry_email) and self._should_send_email(query):
             params = {
                 "to": re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", query or ""),
                 "subject": "Requested summary",
@@ -833,28 +1090,33 @@ class ModularOrchestrator:
                     forced_sources=final_sources,
                 )
                 email_action = json.loads(tool_json)
-                tools_used.append("get_email_or_send")
+                tools_called.append("get_email_or_send")
             except Exception:
                 # If tool wrapper fails, attempt direct email tool so user still gets connect link.
-                try:
-                    from app.tools.emailer import send_email_via_composio
-                    result = send_email_via_composio(
-                        user_id=session_id or "default",
-                        to=params.get("to", []),
-                        subject=params.get("subject", "Requested summary"),
-                        body=params.get("body", ""),
-                    )
-                    if result.get("successful"):
-                        email_action = {"status": "success", "result": result}
-                    else:
-                        email_action = {
-                            "status": "auth_required",
-                            "message": result.get("error", "Authentication required."),
-                            "connect_url": (result.get("data") or {}).get("connect_link"),
-                        }
-                    tools_used.append("get_email_or_send")
-                except Exception:
-                    email_action = {"status": "error", "message": "Email tool failed unexpectedly."}
+                if not (email_action and email_action.get("status") == "success"):
+                    try:
+                        from app.tools.emailer import send_email_via_composio
+                        result = send_email_via_composio(
+                            user_id=session_id or "default",
+                            to=params.get("to", []),
+                            subject=params.get("subject", "Requested summary"),
+                            body=params.get("body", ""),
+                        )
+                        if result.get("successful"):
+                            email_action = {"status": "success", "result": result}
+                        else:
+                            err_msg = (result.get("error") or "").lower()
+                            if any(s in err_msg for s in ["invalid email", "empty recipient", "policy", "blocked"]):
+                                email_action = {"status": "error", "message": result.get("error", "Email failed validation.")}
+                            else:
+                                email_action = {
+                                    "status": "auth_required",
+                                    "message": result.get("error", "Authentication required."),
+                                    "connect_url": (result.get("data") or {}).get("connect_link"),
+                                }
+                        tools_called.append("get_email_or_send")
+                    except Exception as e:
+                        email_action = {"status": "error", "message": f"Email tool failed: {e}"}
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
@@ -890,6 +1152,7 @@ class ModularOrchestrator:
         image_context: Optional[str],
         forced_sources: Optional[List[Dict[str, Any]]],
         active_persona: Optional[str],
+        allow_email: bool = True,
     ) -> Dict[str, Any]:
         """
         Deterministic fallback pipeline when tool-calling fails.
@@ -974,6 +1237,7 @@ class ModularOrchestrator:
         ]
         engine = self._get_synthesis_engine()
         synth = await asyncio.to_thread(engine.synthesize, query, v1_chunks)
+        self._has_synthesized = True
         tools_used.append("synthesize_answer")
 
         # 5) Verify
@@ -983,7 +1247,7 @@ class ModularOrchestrator:
 
         # 6) Email tool (if requested)
         email_action = None
-        if self._should_send_email(query):
+        if allow_email and self._should_send_email(query):
             params = {
                 "to": re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", query or ""),
                 "subject": "Requested summary",
@@ -1010,18 +1274,22 @@ class ModularOrchestrator:
                     if result.get("successful"):
                         email_action = {"status": "success", "result": result}
                     else:
-                        email_action = {
-                            "status": "auth_required",
-                            "message": result.get("error", "Authentication required."),
-                            "connect_url": (result.get("data") or {}).get("connect_link"),
-                        }
-                except Exception:
-                    email_action = {"status": "error", "message": "Email tool failed unexpectedly."}
+                        err_msg = (result.get("error") or "").lower()
+                        if any(s in err_msg for s in ["invalid email", "empty recipient", "policy", "blocked"]):
+                            email_action = {"status": "error", "message": result.get("error", "Email failed validation.")}
+                        else:
+                            email_action = {
+                                "status": "auth_required",
+                                "message": result.get("error", "Authentication required."),
+                                "connect_url": (result.get("data") or {}).get("connect_link"),
+                            }
+                except Exception as e:
+                    email_action = {"status": "error", "message": f"Email tool failed: {e}"}
             tools_used.append("get_email_or_send")
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
         return {
-            "answer": synth.get("answer", ""),
+            "answer": self._strip_email_disclaimer(self._strip_email_template(synth.get("answer", ""))),
             "sources": synth.get("provenance", []),
             "confidence": synth.get("confidence", 0.0),
             "is_hallucinated": verification.get("is_hallucinated", False),

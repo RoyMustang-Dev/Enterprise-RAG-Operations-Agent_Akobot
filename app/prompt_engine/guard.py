@@ -15,7 +15,7 @@ import json
 import logging
 import requests
 from typing import Dict, Any
-from app.infra.llm_client import chat_completion
+from app.infra.llm_client import chat_completion, extract_message_content
 from app.infra.model_registry import get_phase_model
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,9 @@ class PromptInjectionGuard:
                 max_tokens=self.max_tokens,
                 timeout=5,
             )
-            raw_content = data["choices"][0]["message"]["content"].strip().lower()
+            raw_content = extract_message_content(data).strip().lower()
+            if not raw_content:
+                return {"is_malicious": False, "action": "allow", "evidence": "Guard empty response; fail-open"}
             
             if "unsafe" in raw_content:
                 result = {"is_malicious": True, "categories": ["policy_violation"], "action": "block", "evidence": "Llama Guard flagged as unsafe"}

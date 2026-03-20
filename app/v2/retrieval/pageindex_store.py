@@ -40,6 +40,22 @@ def upsert_pageindex_nodes(session_id: str, nodes: List[Dict[str, Any]], tenant_
     conn.close()
 
 
+def insert_pageindex_nodes(session_id: str, nodes: List[Dict[str, Any]], tenant_id: Optional[str] = None):
+    """
+    Inserts nodes without deleting existing session nodes (append mode).
+    """
+    init_pageindex_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    for node in nodes:
+        c.execute(
+            "INSERT INTO pageindex_nodes (session_id, node_id, title, text, depth) VALUES (?, ?, ?, ?, ?)",
+            (session_id, node.get("node_id", ""), node.get("title", ""), node.get("text", ""), int(node.get("depth", 0))),
+        )
+    conn.commit()
+    conn.close()
+
+
 def fetch_pageindex_nodes(session_id: str, tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
     init_pageindex_db(tenant_id)
     conn = _get_conn("app", tenant_id)
@@ -70,6 +86,47 @@ def fetch_pageindex_nodes_by_titles(session_id: str, titles: List[str], tenant_i
     conn.close()
     nodes = [{"node_id": r[0], "title": r[1], "text": r[2], "depth": r[3]} for r in rows]
     return nodes[: max(1, int(limit))]
+
+
+def fetch_pageindex_nodes_by_titles_like(
+    session_id: str,
+    titles: List[str],
+    tenant_id: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Fuzzy title match using LIKE (fallback for filename-based forced sources).
+    """
+    if not titles:
+        return []
+    init_pageindex_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    patterns = [f"%{t}%" for t in titles if t]
+    clauses = " OR ".join(["title LIKE ?"] * len(patterns))
+    c.execute(
+        f"SELECT node_id, title, text, depth FROM pageindex_nodes WHERE session_id = ? AND ({clauses})",
+        (session_id, *patterns),
+    )
+    rows = c.fetchall()
+    conn.close()
+    nodes = [{"node_id": r[0], "title": r[1], "text": r[2], "depth": r[3]} for r in rows]
+    return nodes[: max(1, int(limit))]
+
+
+def fetch_pageindex_session_stats(tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Returns per-session node counts for PageIndex.
+    """
+    init_pageindex_db(tenant_id)
+    conn = _get_conn("app", tenant_id)
+    c = conn.cursor()
+    c.execute(
+        "SELECT session_id, COUNT(*) FROM pageindex_nodes GROUP BY session_id ORDER BY COUNT(*) DESC"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [{"session_id": r[0], "nodes_indexed": r[1]} for r in rows]
 
 
 def delete_pageindex_nodes(session_id: str, tenant_id: Optional[str] = None) -> int:

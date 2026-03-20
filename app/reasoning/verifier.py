@@ -14,7 +14,7 @@ import json
 import logging
 from app.infra.logging_utils import stage_info, stage_warn
 import requests
-from app.infra.llm_client import chat_completion
+from app.infra.llm_client import chat_completion, extract_message_content
 from app.infra.model_registry import get_phase_model
 from typing import Dict, Any, List
 
@@ -74,6 +74,10 @@ class HallucinationVerifier:
         try:
             stage_info(logger, "RAG:VERIFY", "groq_fallback=true")
             response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=12)
+            if response.status_code == 400:
+                # Retry without response_format for models that reject it
+                payload.pop("response_format", None)
+                response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=12)
             response.raise_for_status()
             raw = response.json()["choices"][0]["message"]["content"]
             return self._normalize_output(raw)
@@ -96,8 +100,18 @@ class HallucinationVerifier:
                 response_format={"type": "json_object"},
                 timeout=20,
             )
-            raw = data["choices"][0]["message"]["content"]
-            return self._normalize_output(raw)
+            raw = extract_message_content(data)
+            if not raw:
+                raise ValueError("empty_response")
+            normalized = self._normalize_output(raw)
+            # If modelslab returned truncated/invalid JSON, fall back to Groq without raising noisy errors
+            if (
+                normalized.get("overall_verdict") == "UNVERIFIED"
+                and ("```json" in raw or raw.strip().startswith("{"))
+                and self.groq_key
+            ):
+                return self._invoke_groq_fallback(payload_str)
+            return normalized
         except Exception as e:
             stage_warn(logger, "RAG:VERIFY", f"modelslab_error={e}")
             if self.groq_key:
@@ -147,6 +161,15 @@ class HallucinationVerifier:
                 cleaned = cleaned.split("```json")[1].split("```")[0].strip()
             elif "```" in cleaned:
                 cleaned = cleaned.split("```")[1].strip()
+            # If model returned a bare verdict string, normalize it.
+            if cleaned.strip().upper() in {"SUPPORTED", "UNSUPPORTED", "UNVERIFIED"}:
+                verdict = cleaned.strip().upper()
+                return {
+                    "overall_verdict": verdict,
+                    "score": 0.0,
+                    "is_hallucinated": verdict == "UNSUPPORTED",
+                    "claims": [],
+                }
             data = json.loads(cleaned)
         except Exception:
             return {"overall_verdict": "UNVERIFIED", "score": 0.0, "is_hallucinated": False, "claims": []}

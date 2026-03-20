@@ -15,7 +15,7 @@ load_dotenv(override=True)
 import json
 import logging
 from app.infra.logging_utils import stage_info, stage_warn
-from app.infra.llm_client import chat_completion, achat_completion_stream
+from app.infra.llm_client import chat_completion, achat_completion_stream, extract_message_content
 from app.infra.model_registry import get_phase_model
 import tiktoken
 from tenacity import retry, wait_exponential, stop_after_attempt
@@ -30,8 +30,13 @@ class SynthesisEngine:
     
     def __init__(self, model_override: str = None):
         phase = get_phase_model("rag_synthesis")
-        self.provider = phase["provider"]
-        self.model_id = model_override or phase["model"]
+        # Force Groq for synthesis when available to reduce non-JSON outputs
+        if os.getenv("GROQ_API_KEY"):
+            self.provider = "groq"
+            self.model_id = os.getenv("RAG_SYNTH_GROQ_MODEL", "llama-3.3-70b-versatile")
+        else:
+            self.provider = phase["provider"]
+            self.model_id = model_override or phase["model"]
         self.fallback_provider = phase.get("fallback_provider")
         self.groq_model = os.getenv("RAG_SYNTH_GROQ_MODEL", "llama-3.3-70b-versatile")
         self.gemini_model = os.getenv("RAG_SYNTH_GEMINI_MODEL", "gemini-2.5-flash")
@@ -110,11 +115,15 @@ class SynthesisEngine:
             "temperature": active_temp, # Bounded creativity
             "max_tokens": 2048
         }
+        if payload["provider"] == "groq":
+            payload["response_format"] = {"type": "json_object"}
         
         try:
             stage_info(logger, "RAG:SYNTH", "payload_ready")
             response_json = self._execute_api_call(payload)
-            raw_content = response_json["choices"][0]["message"]["content"]
+            raw_content = extract_message_content(response_json)
+            if not raw_content:
+                raise ValueError("empty_response")
             try:
                 parsed_result = json.loads(raw_content)
                 answer_text = parsed_result.get("answer", "")
@@ -137,6 +146,10 @@ class SynthesisEngine:
                     else:
                         raise ValueError("no json candidate")
                 except Exception:
+                    # If response looks like truncated JSON, force fallback
+                    looks_jsony = raw_content.strip().startswith("{") or raw_content.strip().startswith("```json")
+                    if looks_jsony:
+                        raise ValueError("invalid_json_response")
                     # Last-resort: extract answer field from JSON-ish text.
                     try:
                         import re as _re
@@ -182,8 +195,12 @@ class SynthesisEngine:
                      payload_fb = dict(payload)
                      payload_fb["provider"] = provider
                      payload_fb["model"] = model
+                     if provider == "groq":
+                         payload_fb["response_format"] = {"type": "json_object"}
                      response_json = self._execute_api_call(payload_fb)
-                     raw_content = response_json["choices"][0]["message"]["content"]
+                     raw_content = extract_message_content(response_json)
+                     if not raw_content:
+                         raise ValueError("empty_response")
                      try:
                          parsed_result = json.loads(raw_content)
                          answer_text = parsed_result.get("answer", "")

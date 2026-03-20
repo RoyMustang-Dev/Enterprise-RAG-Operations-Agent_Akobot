@@ -1,0 +1,28 @@
+ve_chat_turn(session_id=session_id, role="user", content=str(query), tenant_id=x_tenant_id)
+        history = get_chat_history(session_id=session_id, tenant_id=x_tenant_id)
+
+    # ── Invoke V2 Orchestrator ─────────────────────────────────────────────────
+    orchestrator = _get_v2_orchestrator()
+    if not orchestrator:
+        raise HTTPException(status_code=501, detail="V2 Orchestrator failed to initialize. Check API keys.")
+
+    try:
+        forced_sources = []
+        if inline_filenames:
+            try:
+                from app.v2.retrieval.pageindex_tool import fetch_nodes_for_titles
+                forced_sources = fetch_nodes_for_titles(
+                    session_id=session_id,
+                    titles=inline_filenames,
+                    tenant_id=x_tenant_id,
+                    limit=24,
+                )
+            except Exception as e:
+                logger.warning(f"[V2 CHAT] Failed to fetch forced sources: {e}")
+        result = await orchestrator.invoke(
+            query=str(query),
+            session_id=session_id,
+            tenant_id=x_tenant_id,
+            image_context=image_context,
+            chat_history=history,
+            forced_sources=for

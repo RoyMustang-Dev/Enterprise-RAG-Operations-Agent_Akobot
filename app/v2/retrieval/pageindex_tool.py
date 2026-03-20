@@ -17,6 +17,7 @@ import re
 import json
 import logging
 import hashlib
+import uuid
 import asyncio
 from typing import Optional, List, Dict, Any
 
@@ -68,28 +69,57 @@ def _flatten_tree(tree: List[Dict], depth: int = 0) -> List[Dict]:
     return flat
 
 
-def store_documents_in_tree_cache(session_id: str, documents: List[Dict], tenant_id: Optional[str] = None) -> int:
+def store_documents_in_tree_cache(
+    session_id: str,
+    documents: List[Dict],
+    tenant_id: Optional[str] = None,
+    mode: str = "append",
+) -> int:
     """
-    Builds a tree from a list of document dicts (each with 'content' key)
-    and stores it keyed by session_id. Returns total node count.
+    Builds trees from document dicts (each with 'content' key) and stores them
+    keyed by session_id. Returns total node count.
+    mode=append: add nodes to existing session
+    mode=overwrite: clear existing nodes for session before inserting
     """
-    combined_md = ""
-    for doc in documents:
-        title = doc.get("filename") or doc.get("url") or "Document"
+    mode = (mode or "append").lower()
+    all_nodes: List[Dict[str, Any]] = []
+
+    for idx, doc in enumerate(documents):
+        title = doc.get("filename") or doc.get("url") or f"Document_{idx+1}"
         content = doc.get("content", "")
         # Wrap each document as a top-level H1 section for consistent tree parsing
-        combined_md += f"\n\n# {title}\n\n{content}\n"
+        combined_md = f"\n\n# {title}\n\n{content}\n"
+        try:
+            tree = build_tree_from_markdown(combined_md)
+            flat = _flatten_tree(tree)
+            # Prefix node_id to prevent collisions across appended docs
+            prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", str(title))[:50] or f"doc{idx+1}"
+            prefix = f"{prefix}_{uuid.uuid4().hex[:8]}"
+            for n_i, node in enumerate(flat):
+                node_id = node.get("node_id") or f"node_{n_i}"
+                node["node_id"] = f"{prefix}:{node_id}"
+                node["title"] = node.get("title") or title
+            all_nodes.extend(flat)
+        except Exception as e:
+            logger.error(f"[PAGEINDEX TOOL] Failed to build tree for {title}: {e}")
+
+    if not all_nodes:
+        return 0
 
     try:
-        tree = build_tree_from_markdown(combined_md)
-        flat = _flatten_tree(tree)
-        from app.v2.retrieval.pageindex_store import upsert_pageindex_nodes
-        _TREE_CACHE[_cache_key(session_id, tenant_id)] = flat
-        upsert_pageindex_nodes(session_id, flat, tenant_id=tenant_id)
-        logger.info(f"[PAGEINDEX TOOL] Stored {len(flat)} nodes for session={session_id}")
-        return len(flat)
+        from app.v2.retrieval.pageindex_store import insert_pageindex_nodes, delete_pageindex_nodes
+        if mode == "overwrite":
+            delete_pageindex_nodes(session_id, tenant_id=tenant_id)
+        insert_pageindex_nodes(session_id, all_nodes, tenant_id=tenant_id)
+        cache_key = _cache_key(session_id, tenant_id)
+        if mode == "append" and cache_key in _TREE_CACHE:
+            _TREE_CACHE[cache_key].extend(all_nodes)
+        else:
+            _TREE_CACHE[cache_key] = all_nodes
+        logger.info(f"[PAGEINDEX TOOL] Stored {len(all_nodes)} nodes for session={session_id} mode={mode}")
+        return len(all_nodes)
     except Exception as e:
-        logger.error(f"[PAGEINDEX TOOL] Failed to build tree: {e}")
+        logger.error(f"[PAGEINDEX TOOL] Failed to store nodes: {e}")
         return 0
 
 
@@ -140,9 +170,14 @@ def search_tree(session_id: str, query: str, top_k: int = 5, tenant_id: Optional
 
 
 def fetch_nodes_for_titles(session_id: str, titles: List[str], tenant_id: Optional[str] = None, limit: int = 20) -> List[Dict]:
-    """Fetch nodes by exact title matches (used for inline-uploaded docs)."""
-    from app.v2.retrieval.pageindex_store import fetch_pageindex_nodes_by_titles
+    """Fetch nodes by exact title matches, with LIKE fallback (used for inline-uploaded docs)."""
+    from app.v2.retrieval.pageindex_store import (
+        fetch_pageindex_nodes_by_titles,
+        fetch_pageindex_nodes_by_titles_like,
+    )
     nodes = fetch_pageindex_nodes_by_titles(session_id, titles, tenant_id=tenant_id, limit=limit)
+    if not nodes:
+        nodes = fetch_pageindex_nodes_by_titles_like(session_id, titles, tenant_id=tenant_id, limit=limit)
     results = []
     for node in nodes:
         results.append({

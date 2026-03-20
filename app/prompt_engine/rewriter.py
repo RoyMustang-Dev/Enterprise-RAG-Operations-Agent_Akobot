@@ -8,7 +8,7 @@ from typing import Dict, Any
 from tenacity import retry, wait_exponential, stop_after_attempt
 import asyncio
 import re
-from app.infra.llm_client import achat_completion
+from app.infra.llm_client import achat_completion, extract_message_content
 from app.infra.model_registry import get_phase_model
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,9 @@ class PromptRewriter:
                 response_format={"type": "json_object"},
                 timeout=15,
             )
-            json_str = data["choices"][0]["message"]["content"]
+            json_str = extract_message_content(data)
+            if not json_str:
+                raise ValueError("empty_response")
             try:
                 return json.loads(json_str)
             except json.JSONDecodeError:
@@ -134,6 +136,27 @@ class PromptRewriter:
                         return json.loads(match.group(1))
                     except Exception:
                         pass
+                # Fallback attempt: stricter JSON-only prompt and Groq if available
+                try:
+                    fallback_provider = "groq" if os.getenv("GROQ_API_KEY") else self.provider
+                    fallback_model = os.getenv("REWRITER_GROQ_MODEL", "llama-3.1-8b-instant")
+                    data_fb = await achat_completion(
+                        provider=fallback_provider,
+                        model=fallback_model if fallback_provider == "groq" else self.model_id,
+                        messages=[
+                            {"role": "system", "content": (self.system_prompt or "") + "\nReturn ONLY valid JSON."},
+                            {"role": "user", "content": user_payload},
+                        ],
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        response_format={"type": "json_object"},
+                        timeout=15,
+                    )
+                    json_fb = extract_message_content(data_fb)
+                    if json_fb:
+                        return json.loads(json_fb)
+                except Exception:
+                    pass
                 logger.error("[MoE - REWRITER] Schema Failure: Non-JSON payload returned.")
                 return {"original_user_prompt": user_prompt, "prompts": {"standard_med": {"prompt": user_prompt}}}
 
